@@ -2,4 +2,10 @@
 .env
 node_modules/
 dist/
+coverage/
 .DS_Store
+Thumbs.db
+.vscode/
+.idea/
+npm-debug.log*
+

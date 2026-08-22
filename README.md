@@ -1,8 +1,23 @@
 # webhook-gateway
 
-A webhook ingest, delivery, and replay gateway — built in public, in phases.
+A webhook ingest, delivery, and replay gateway. It's a portfolio project that demonstrates the parts of backend engineering most junior portfolios skip: retrying failed deliveries safely, avoiding duplicate side effects (idempotency), routing permanently-failed messages to a dead-letter queue, and using a circuit breaker to stop hammering a downstream service that's down.
 
-Status: Phase 0 (Recon) complete. See the project journal for design notes, decisions, and progress.
+Status: Phase 1 (Skeleton).
+
+## Stack
+
+- **Node.js + TypeScript** — typed JavaScript, catches whole classes of bugs before the code even runs.
+- **Express** — the most common Node.js web server framework, and the one interviewers ask about most.
+- **Vitest** — the test runner. Chosen over Jest because it needs almost no configuration to work with TypeScript, and it's fast.
+- **Supertest** — lets tests call HTTP endpoints (like `/health`) directly, without starting a real server on a real port.
+
+## Running it
+
+```bash
+npm install
+npm run dev    # starts the dev server
+npm test       # runs the test suite
+```
 
 ## Phases
 
