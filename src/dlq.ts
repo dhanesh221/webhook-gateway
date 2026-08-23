@@ -1,6 +1,10 @@
-// DLQ CLI: `npm run dlq -- list` / `npm run dlq -- replay <event-id>`.
+// DLQ commands. The primary entry point is the unified CLI
+// (`npm run gateway -- dlq list` / `npm run gateway -- dlq replay <event-id>`),
+// which imports list() and replay() from here. The standalone `npm run dlq`
+// entry point below is kept as a working alias so existing habits and any
+// scripts written against it don't break.
 import dotenv from "dotenv";
-dotenv.config({ path: ".env.local" });
+dotenv.config({ path: ".env.local", quiet: true });
 
 import { getSupabase } from "./supabase";
 
@@ -42,7 +46,7 @@ export async function list(limit = 50): Promise<void> {
 
 export async function replay(id: string | undefined): Promise<void> {
   if (!id) {
-    console.error("Usage: npm run dlq -- replay <event-id>");
+    console.error("Usage: npm run gateway -- dlq replay <event-id>");
     process.exitCode = 1;
     return;
   }
@@ -92,8 +96,8 @@ async function main() {
   } else if (command === "replay") {
     await replay(arg);
   } else {
-    console.error("Usage: npm run dlq -- list");
-    console.error("       npm run dlq -- replay <event-id>");
+    console.error("Usage: npm run gateway -- dlq list");
+    console.error("       npm run gateway -- dlq replay <event-id>");
     process.exitCode = 1;
   }
 }

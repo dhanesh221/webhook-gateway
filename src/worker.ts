@@ -1,22 +1,25 @@
-// Standalone entry point, run via `npm run worker`. Separate from deliveryWorker.ts
-// so the actual claim/deliver/mark logic can be tested directly without waiting on
-// real timers (see tests/deliveryWorker.test.ts).
+// Standalone worker entry point, run via `npm run worker`. Still supported for
+// running the worker on its own (a second machine, a separate container), but
+// `npm run gateway -- start` runs the server and this same loop together in one
+// process and is the usual way in.
+//
+// The loop itself lives in src/runtime.ts so both entry points share exactly one
+// implementation, and so the claim/deliver/mark logic in deliveryWorker.ts stays
+// directly testable without waiting on real timers.
 import dotenv from "dotenv";
 dotenv.config({ path: ".env.local" });
 
-import { getSupabase } from "./supabase";
-import { processPendingBatch } from "./deliveryWorker";
+import { startWorker, DEFAULT_POLL_INTERVAL_MS } from "./runtime";
 
-const POLL_INTERVAL_MS = 2000;
+console.log(`[worker] starting, polling every ${DEFAULT_POLL_INTERVAL_MS}ms`);
+const worker = startWorker(DEFAULT_POLL_INTERVAL_MS);
 
-async function tick() {
-  try {
-    await processPendingBatch(getSupabase());
-  } catch (err) {
-    console.error(`[worker] unexpected error during poll: ${(err as Error).message}`);
-  }
-}
+const stop = () => {
+  worker
+    .close()
+    .then(() => process.exit(0))
+    .catch(() => process.exit(1));
+};
 
-console.log(`[worker] starting, polling every ${POLL_INTERVAL_MS}ms`);
-tick();
-setInterval(tick, POLL_INTERVAL_MS);
+process.once("SIGINT", stop);
+process.once("SIGTERM", stop);

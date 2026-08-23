@@ -2,7 +2,11 @@
 
 A webhook ingest, delivery, and replay gateway. It's a portfolio project that demonstrates the parts of backend engineering most junior portfolios skip: retrying failed deliveries safely, avoiding duplicate side effects (idempotency), routing permanently-failed messages to a dead-letter queue, and using a circuit breaker to stop hammering a downstream service that's down.
 
-Status: Phase 5 (Dashboard — auth + manual replay).
+Status: Phase 6 (CLI — one command starts everything and exposes it on a public URL).
+
+```bash
+npm run gateway -- start
+```
 
 ## Stack
 
@@ -12,6 +16,8 @@ Status: Phase 5 (Dashboard — auth + manual replay).
 - **Vitest** — the test runner. Chosen over Jest because it needs almost no configuration to work with TypeScript, and it's fast.
 - **Supertest** — lets tests call HTTP endpoints directly, without starting a real server on a real port.
 - **bcryptjs + jsonwebtoken** — dashboard auth (Phase 5): bcrypt hashes the admin password so the stored value can't be reversed; JWT signs the session cookie so the server can trust it without keeping a session table.
+- **commander** — CLI subcommand parsing (Phase 6): `gateway start`, `gateway dlq list`, `gateway dlq replay <id>`, and a real `--help`.
+- **localtunnel** — gives the local server a public HTTPS URL so a real webhook sender can reach it during development. See [CLI and public tunnel](#cli-and-public-tunnel-phase-6) for why this and not `cloudflared`.
 
 ## Endpoints
 
@@ -98,7 +104,14 @@ Because the failure counter is per-destination, not per-event, a handful of diff
 
 ## Dead-letter queue (Phase 4)
 
-Events that exhaust their 5 delivery attempts land in `status = 'dead_lettered'` and stop being retried automatically. A small CLI inspects and replays them:
+Events that exhaust their 5 delivery attempts land in `status = 'dead_lettered'` and stop being retried automatically. The CLI inspects and replays them:
+
+```bash
+npm run gateway -- dlq list
+npm run gateway -- dlq replay <event-id>
+```
+
+The older standalone form still works and does exactly the same thing — it is kept as an alias so nothing written against it breaks:
 
 ```bash
 npm run dlq -- list
@@ -166,6 +179,78 @@ Both read routes go through `SECURITY DEFINER` RPCs (migration `add_dashboard_re
 
 This is a deliberately simple, self-rolled session scheme: a bcrypt-hashed password in `.env.local`, and a JWT signed with a local secret, handed to the browser as an httpOnly cookie with a 12-hour expiry. The reason it's sufficient is that **the browser never talks to Supabase**. In a typical Supabase app the frontend holds the anon key and calls the database directly, so Supabase's own auth has to be the gate — it's the only thing in the request path. Here the Express server is the only thing that ever holds that key; the browser only ever talks to this server's API. That makes a server-side session cookie a real gate rather than a decorative one, and it avoids wiring up Supabase Auth's email-confirmation flow for what is a single-operator admin page. The trade-offs are accepted and worth naming: one shared password rather than per-user accounts, no password reset flow, and no way to revoke an issued token before it expires — which is why the expiry is short.
 
+## CLI and public tunnel (Phase 6)
+
+Up to Phase 5 the gateway only ever listened on `localhost`, which meant no real webhook sender could reach it — you could test it against yourself, but never against Stripe. Phase 6 fixes that with one command:
+
+```bash
+npm run gateway -- start
+```
+
+That starts the ingest server, starts the delivery worker, opens a public tunnel to the local port, and prints where to point a sender:
+
+```
+Your gateway is live at: https://quiet-jars-push.loca.lt
+Point Stripe (or any webhook sender) at https://quiet-jars-push.loca.lt/webhooks/<source>
+  e.g. https://quiet-jars-push.loca.lt/webhooks/stripe
+
+Dashboard: http://localhost:3000/dashboard.html
+  Admin password lives in .env.local (written by `npm run setup:auth`).
+
+Delivery worker is running in this same process. Press Ctrl+C to stop both.
+```
+
+The URL changes every run — quick tunnels are ephemeral by design.
+
+### Commands
+
+```bash
+npm run gateway -- --help                     # all subcommands
+npm run gateway -- start                      # server + worker + public tunnel
+npm run gateway -- start --port 4100          # bind a different port (tunnel follows it)
+npm run gateway -- start --no-tunnel          # local only, no public URL
+npm run gateway -- start --poll-interval 500  # faster worker polling
+npm run gateway -- dlq list
+npm run gateway -- dlq replay <event-id>
+```
+
+### One process, not three
+
+`start` runs the server and the worker **in the same process**, and `Ctrl+C` stops both. That is a deliberate choice rather than spawning child processes: `npm run` and `npx` each spawn a child that actually holds the port, and killing the wrapper leaves that child alive. This project lost most of a phase to exactly that — an orphaned server on port 3000 serving stale code and returning confusing 404s. A single process has no parent/child gap to leak through.
+
+Shutdown closes things in reverse order of exposure — tunnel first (so no new external traffic arrives), then the HTTP server, then the worker, which is awaited so an in-flight delivery finishes recording its outcome instead of being cut off between "request sent" and "result written". Each step runs even if an earlier one throws, so one stubborn resource can't leave the port bound.
+
+### Which tunnel, and why
+
+**localtunnel**, because `cloudflared` is not installed on this machine.
+
+A Cloudflare quick tunnel (`cloudflared tunnel --url http://localhost:3000`) would be the better option — no account needed, no interstitial page, and more reliable. But installing `cloudflared` requires a system package manager and root, which is out of scope here. localtunnel is a plain npm dependency with a programmatic Node API and no signup, so it works with what is actually available. Swapping back later means changing `src/tunnel.ts` only — everything else talks to the `openTunnel(port) → { url, close() }` interface.
+
+**The caveat that comes with localtunnel:** `loca.lt` sometimes shows a one-time "click to continue" interstitial HTML page to an IP address the first time it sees it. A human in a browser clicks through it once; an automated sender like Stripe, hitting the URL directly, can receive that HTML page instead of reaching the gateway — which looks like the gateway silently ignoring webhooks.
+
+Two ways around it:
+
+- Send the header `bypass-tunnel-reminder: 1` (any value works). Good for `curl` and for any sender whose headers you control.
+- Visit the URL once in a browser from the same IP and click through. Good for senders whose headers you don't control — which includes Stripe.
+
+If a tunnel fails to open, `start` says so and keeps serving locally rather than exiting. Losing external reachability shouldn't take down a gateway that otherwise works.
+
+### Pointing a real Stripe webhook at this
+
+1. Run `npm run gateway -- start` and copy the printed public URL.
+2. Open the URL in a browser once and click through the loca.lt interstitial if it appears. Do this **before** step 3 — otherwise Stripe's endpoint-verification request may hit the interstitial and the endpoint won't validate.
+3. In the Stripe Dashboard, go to **Developers → Webhooks → Add endpoint** and set the endpoint URL to `https://<your-url>.loca.lt/webhooks/stripe`.
+4. Select the events to send, save, and use **Send test webhook** to fire one.
+5. Watch it arrive at `http://localhost:3000/dashboard.html`, or check the terminal — the worker logs each delivery attempt.
+
+Set `DESTINATION_URL` in `.env.local` first, or events will be stored and then fail delivery with "no destination_url set". The URL is ephemeral, so a tunnel restart means updating the endpoint in Stripe again.
+
+Signature verification is **not** implemented — this accepts any POST to `/webhooks/:source`. That is fine for development against a URL nobody else knows, and is Phase 7 work before anything like this faces the real internet for long.
+
+### Dependency note
+
+`localtunnel@2.0.2` pulls in an old `axios` with open high-severity advisories (`npm audit`). It is a development-only convenience that never runs in production, so it is accepted here rather than pinned around — but it is a real reason not to promote this dependency into a production path.
+
 ## Security notes
 
 The `webhook_events` table has Row Level Security enabled with a policy permitting `INSERT` only for the `anon` role — no select, update, or delete. The ingest endpoint runs server-side but deliberately uses that low-privilege key, so a leaked key cannot be used to read or tamper with stored events.
@@ -189,11 +274,18 @@ DESTINATION_URL=...
 ```bash
 npm install
 npm run setup:auth  # one-time: generates the dashboard password into .env.local
-npm run dev     # starts the ingest HTTP server + dashboard (http://localhost:3000)
-npm run worker  # starts the delivery worker (separate process)
-npm run dlq -- list          # inspect dead-lettered events
-npm run dlq -- replay <id>   # replay one back to pending
+
+npm run gateway -- start     # the usual way in: server + worker + public tunnel, Ctrl+C stops all
+npm run gateway -- --help    # all subcommands
+
 npm test        # runs the test suite
+```
+
+Individual pieces, still available for running them apart (a second machine, a separate container, or just quieter output):
+
+```bash
+npm run dev     # ingest HTTP server + dashboard only (http://localhost:3000), no tunnel
+npm run worker  # delivery worker only, as its own process
 ```
 
 ## Phases
@@ -203,6 +295,6 @@ npm test        # runs the test suite
 2. Ingest endpoint
 3. Delivery worker (backoff + jitter)
 4. Dead-letter queue + circuit breaker
-5. Dashboard (auth + replay) (current)
-6. CLI (localhost tunnel)
+5. Dashboard (auth + replay)
+6. CLI (localhost tunnel) (current)
 7. Production polish
