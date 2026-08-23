@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Sign in — webhook-gateway</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <div class="login-card">
+      <h1>webhook-gateway</h1>
+      <p class="muted">Dashboard sign in</p>
+
+      <form id="login-form">
+        <label for="password">Password</label>
+        <input
+          id="password"
+          type="password"
+          autocomplete="current-password"
+          required
+          autofocus
+        />
+        <button type="submit" class="primary" id="submit">Sign in</button>
+      </form>
+
+      <p class="msg" id="msg" role="status"></p>
+    </div>
+
+    <script>
+      const form = document.getElementById("login-form");
+      const passwordInput = document.getElementById("password");
+      const submit = document.getElementById("submit");
+      const msg = document.getElementById("msg");
+
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        msg.textContent = "";
+        msg.className = "msg";
+        submit.disabled = true;
+
+        try {
+          const res = await fetch("/api/login", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ password: passwordInput.value }),
+          });
+
+          if (res.ok) {
+            window.location.replace("/dashboard.html");
+            return;
+          }
+
+          const body = await res.json().catch(() => ({}));
+          msg.textContent = body.error || "Sign in failed.";
+          msg.className = "msg error";
+          passwordInput.value = "";
+          passwordInput.focus();
+        } catch {
+          msg.textContent = "Could not reach the server.";
+          msg.className = "msg error";
+        } finally {
+          submit.disabled = false;
+        }
+      });
+    </script>
+  </body>
+</html>

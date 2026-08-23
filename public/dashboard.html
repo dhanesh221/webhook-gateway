@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Dashboard — webhook-gateway</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>webhook-gateway</h1>
+        <button id="logout">Sign out</button>
+      </header>
+
+      <h2>Events</h2>
+      <div class="controls">
+        <label for="status">Status</label>
+        <select id="status">
+          <option value="">All</option>
+          <option value="pending">pending</option>
+          <option value="in_progress">in_progress</option>
+          <option value="delivered">delivered</option>
+          <option value="failed">failed</option>
+          <option value="dead_lettered">dead_lettered</option>
+        </select>
+        <button id="refresh">Refresh</button>
+        <span class="muted" id="event-count"></span>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Source</th>
+              <th>Status</th>
+              <th>Attempts</th>
+              <th>Received</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="events-body">
+            <tr>
+              <td colspan="6" class="muted">Loading…</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p class="msg" id="msg" role="status"></p>
+
+      <h2>Circuit breakers</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Destination</th>
+              <th>State</th>
+              <th>Consecutive failures</th>
+              <th>Next probe</th>
+            </tr>
+          </thead>
+          <tbody id="breakers-body">
+            <tr>
+              <td colspan="4" class="muted">Loading…</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </main>
+
+    <script>
+      const statusSelect = document.getElementById("status");
+      const refreshButton = document.getElementById("refresh");
+      const logoutButton = document.getElementById("logout");
+      const eventsBody = document.getElementById("events-body");
+      const breakersBody = document.getElementById("breakers-body");
+      const eventCount = document.getElementById("event-count");
+      const msg = document.getElementById("msg");
+
+      function toLogin() {
+        window.location.replace("/login.html");
+      }
+
+      // Every data call goes through here so the 401 -> login redirect is
+      // handled in exactly one place. Throws a sentinel on redirect so callers
+      // stop rather than rendering against a half-loaded page.
+      async function api(path, options) {
+        const res = await fetch(path, options);
+        if (res.status === 401) {
+          toLogin();
+          throw new Error("unauthenticated");
+        }
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          throw new Error(body.error || `Request failed (${res.status})`);
+        }
+        return body;
+      }
+
+      function setMessage(text, kind) {
+        msg.textContent = text || "";
+        msg.className = kind ? `msg ${kind}` : "msg";
+      }
+
+      function shortId(id) {
+        return typeof id === "string" && id.length > 8 ? id.slice(0, 8) : id;
+      }
+
+      function formatTime(value) {
+        if (!value) return "—";
+        const date = new Date(value);
+        return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+      }
+
+      function truncate(value, max) {
+        if (!value) return "—";
+        return value.length > max ? `${value.slice(0, max - 1)}…` : value;
+      }
+
+      // textContent everywhere rather than innerHTML: source and
+      // destination_url are attacker-controlled (source comes straight off the
+      // request path) and are still unvalidated server-side.
+      function cell(row, text, className) {
+        const td = document.createElement("td");
+        td.textContent = text;
+        if (className) td.className = className;
+        row.appendChild(td);
+        return td;
+      }
+
+      function emptyRow(body, columns, text) {
+        const tr = document.createElement("tr");
+        const td = document.createElement("td");
+        td.colSpan = columns;
+        td.className = "muted";
+        td.textContent = text;
+        tr.appendChild(td);
+        body.replaceChildren(tr);
+      }
+
+      async function loadEvents() {
+        const status = statusSelect.value;
+        const query = status ? `?status=${encodeURIComponent(status)}` : "";
+        const { events } = await api(`/api/events${query}`);
+
+        eventCount.textContent = `${events.length} event${events.length === 1 ? "" : "s"}`;
+
+        if (events.length === 0) {
+          emptyRow(eventsBody, 6, "No events.");
+          return;
+        }
+
+        const rows = events.map((event) => {
+          const tr = document.createElement("tr");
+          cell(tr, shortId(event.id), "mono").title = event.id;
+          cell(tr, truncate(event.source, 28)).title = event.source || "";
+
+          const statusCell = cell(tr, "");
+          const pill = document.createElement("span");
+          pill.className = `pill ${event.status}`;
+          pill.textContent = event.status;
+          statusCell.appendChild(pill);
+
+          cell(tr, String(event.attempts));
+          cell(tr, formatTime(event.received_at));
+
+          const actionCell = cell(tr, "");
+          if (event.status === "dead_lettered") {
+            const button = document.createElement("button");
+            button.textContent = "Replay";
+            button.addEventListener("click", () => replay(event.id, button));
+            actionCell.appendChild(button);
+          }
+
+          return tr;
+        });
+
+        eventsBody.replaceChildren(...rows);
+      }
+
+      async function loadBreakers() {
+        const { breakers } = await api("/api/circuit-breakers");
+
+        if (breakers.length === 0) {
+          emptyRow(breakersBody, 4, "No circuit breakers recorded.");
+          return;
+        }
+
+        const rows = breakers.map((breaker) => {
+          const tr = document.createElement("tr");
+          cell(tr, truncate(breaker.destination_url, 52), "mono").title =
+            breaker.destination_url || "";
+
+          const stateCell = cell(tr, "");
+          const pill = document.createElement("span");
+          pill.className = `pill ${breaker.state}`;
+          pill.textContent = breaker.state;
+          stateCell.appendChild(pill);
+
+          cell(tr, String(breaker.consecutive_failures));
+          cell(tr, formatTime(breaker.next_probe_at));
+          return tr;
+        });
+
+        breakersBody.replaceChildren(...rows);
+      }
+
+      async function replay(id, button) {
+        button.disabled = true;
+        setMessage("");
+        try {
+          const body = await api(`/api/events/${encodeURIComponent(id)}/replay`, {
+            method: "POST",
+          });
+          setMessage(`Replayed ${shortId(id)} — ${body.message}`, "ok");
+          await refresh();
+        } catch (error) {
+          if (error.message === "unauthenticated") return;
+          setMessage(error.message, "error");
+          button.disabled = false;
+        }
+      }
+
+      async function refresh() {
+        try {
+          await Promise.all([loadEvents(), loadBreakers()]);
+        } catch (error) {
+          if (error.message === "unauthenticated") return;
+          setMessage(error.message, "error");
+        }
+      }
+
+      statusSelect.addEventListener("change", refresh);
+      refreshButton.addEventListener("click", () => {
+        setMessage("");
+        refresh();
+      });
+
+      logoutButton.addEventListener("click", async () => {
+        await fetch("/api/logout", { method: "POST" }).catch(() => {});
+        toLogin();
+      });
+
+      refresh();
+    </script>
+  </body>
+</html>
