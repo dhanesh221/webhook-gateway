@@ -19,9 +19,16 @@ import type { ClaimedWebhookEvent } from "../src/deliveryWorker";
 //   replay_webhook_event also returns no signal either way (confirmed
 //   empirically against a real dead-lettered row and a nonexistent id) — the
 //   DLQ CLI checks list_dead_lettered_events itself to report not-found.
+//
+// It also models the one non-RPC call the ingest endpoint makes,
+// `.from("webhook_events").insert(row)`, including the unique index on
+// (source, idempotency_key) that surfaces as Postgres error 23505. That lets a
+// single fake back the whole pipeline at once — the real Express app writing
+// into the same table the real worker later claims from.
 
 export interface FakeRow extends ClaimedWebhookEvent {
   status: string;
+  idempotency_key?: string | null;
 }
 
 interface FakeBreaker {
@@ -52,6 +59,46 @@ export function makeFakeSupabase(
   }
 
   const client = {
+    // Mirrors src/app.ts's only database call. The real table's unique index on
+    // (source, idempotency_key) rejects a redelivery with 23505; NULL keys never
+    // collide in Postgres, so an omitted Idempotency-Key never dedupes.
+    from: (tableName: string) => {
+      if (tableName !== "webhook_events") {
+        throw new Error(`unexpected table: ${tableName}`);
+      }
+      return {
+        insert: async (row: Record<string, unknown>) => {
+          const source = row.source as string;
+          const key = (row.idempotency_key ?? null) as string | null;
+
+          if (key !== null) {
+            for (const existing of table.values()) {
+              if (existing.source === source && existing.idempotency_key === key) {
+                return {
+                  data: null,
+                  error: {
+                    code: "23505",
+                    message: "duplicate key value violates unique constraint",
+                  },
+                };
+              }
+            }
+          }
+
+          table.set(row.id as string, {
+            id: row.id as string,
+            source,
+            idempotency_key: key,
+            attempts: 0,
+            payload: row.payload,
+            destination_url: (row.destination_url ?? null) as string | null,
+            status: "pending",
+          });
+          return { data: null, error: null };
+        },
+      };
+    },
+
     rpc: async (fn: string, args?: Record<string, unknown>) => {
       switch (fn) {
         case "claim_pending_webhook_events": {
@@ -112,7 +159,10 @@ export function makeFakeSupabase(
           const limit = (args?.p_limit as number) ?? 50;
           const deadLettered = [...table.values()]
             .filter((r) => r.status === "dead_lettered")
-            .slice(0, limit);
+            .slice(0, limit)
+            // The real RPC returns full webhook_events rows; updated_at is the
+            // only extra column the DLQ CLI actually prints.
+            .map((r) => ({ ...r, updated_at: new Date().toISOString() }));
           return { data: deadLettered, error: null };
         }
 
