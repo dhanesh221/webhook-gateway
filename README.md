@@ -2,7 +2,7 @@
 
 A webhook ingest, delivery, and replay gateway. It's a portfolio project that demonstrates the parts of backend engineering most junior portfolios skip: retrying failed deliveries safely, avoiding duplicate side effects (idempotency), routing permanently-failed messages to a dead-letter queue, and using a circuit breaker to stop hammering a downstream service that's down.
 
-Status: Phase 4 (Dead-letter queue + circuit breaker).
+Status: Phase 5 (Dashboard — auth + manual replay).
 
 ## Stack
 
@@ -11,6 +11,7 @@ Status: Phase 4 (Dead-letter queue + circuit breaker).
 - **Supabase (Postgres)** — stores received webhook events.
 - **Vitest** — the test runner. Chosen over Jest because it needs almost no configuration to work with TypeScript, and it's fast.
 - **Supertest** — lets tests call HTTP endpoints directly, without starting a real server on a real port.
+- **bcryptjs + jsonwebtoken** — dashboard auth (Phase 5): bcrypt hashes the admin password so the stored value can't be reversed; JWT signs the session cookie so the server can trust it without keeping a session table.
 
 ## Endpoints
 
@@ -108,6 +109,63 @@ npm run dlq -- replay <event-id>
 
 **Implementation note:** `replay_webhook_event` returns no signal either way — calling it on a real dead-lettered row and on a nonexistent id both come back as `{ data: null, error: null }` (confirmed empirically against the live RPC before writing the CLI). So `replay` checks `list_dead_lettered_events` itself first to decide whether to report success or a clear "not dead-lettered (not found, or already replayed)" message, rather than trusting the RPC's return value.
 
+## Dashboard (Phase 5)
+
+A small web dashboard for watching events and replaying dead-lettered ones by hand, served by the same Express process as the ingest endpoint.
+
+### Logging in
+
+Credentials are generated once, locally:
+
+```bash
+npm run setup:auth
+```
+
+That writes three things into `.env.local` (which is gitignored and never committed):
+
+- `ADMIN_PASSWORD_HASH` — a bcrypt hash of a freshly generated random password.
+- `SESSION_SECRET` — a random value used to sign session tokens.
+- A comment line holding the **plaintext password**.
+
+The plaintext password exists in that one file and nowhere else. It is never printed to the console, never written to the README, never committed, and cannot be recovered from the hash. Open `.env.local`, copy the password somewhere safe, and delete the comment line if you'd rather it not sit there.
+
+Re-running `npm run setup:auth` refuses to overwrite an existing configuration. Use `npm run setup:auth -- --force` to deliberately generate a new password — which invalidates the old one and signs everyone out.
+
+Then start the server and visit <http://localhost:3000>:
+
+```bash
+npm run dev
+```
+
+`/` redirects to `/login.html` or `/dashboard.html` depending on whether you already have a valid session.
+
+### Pages
+
+- **`/login.html`** — password form; posts to `/api/login` and redirects to the dashboard on success.
+- **`/dashboard.html`** — a status filter, a table of the 100 most recent events (id, source, status, attempts, received), a circuit breakers table (destination, state, consecutive failures, next probe), and a **Replay** button on dead-lettered rows. Any fetch that comes back `401` bounces the browser to the login page.
+
+Plain HTML and vanilla JavaScript, no build step and no framework — the interesting parts of this project are behind the API, not in front of it.
+
+### API routes
+
+| Route | Auth | Purpose |
+|---|---|---|
+| `POST /api/login` | public | `{ "password": "..." }` → sets an httpOnly session cookie. Wrong, missing, or malformed password all get the same `401 {"error":"Invalid credentials"}`. |
+| `POST /api/logout` | public | Clears the session cookie. Works without a valid session — logging out of an expired session isn't an error. |
+| `GET /api/events?status=` | session | Calls `list_webhook_events`. `status` is optional; an unrecognised value gets a `400` rather than a silently empty list. Capped at 100 rows. |
+| `GET /api/circuit-breakers` | session | Calls `list_circuit_breakers`. |
+| `POST /api/events/:id/replay` | session | Calls `replay_webhook_event`. Returns `409` with a clear message if the event isn't dead-lettered. |
+
+Both read routes go through `SECURITY DEFINER` RPCs (migration `add_dashboard_read_functions`) for the same reason every other database call in this project does: the `anon` key still has no direct read rights on `webhook_events`.
+
+`GET /api/events` deliberately does **not** return each event's `payload` or `headers`. The RPC returns full rows, but a single payload can be ~100 KB, so 100 of them would be a multi-megabyte response for a table that renders five columns of metadata.
+
+`POST /api/events/:id/replay` checks the dead-lettered list itself before calling the RPC, for the same reason the DLQ CLI does — `replay_webhook_event` returns `{ data: null, error: null }` whether it replayed a row or matched nothing, so trusting its return value would report success for every id, including ids that don't exist.
+
+### Why not Supabase Auth here
+
+This is a deliberately simple, self-rolled session scheme: a bcrypt-hashed password in `.env.local`, and a JWT signed with a local secret, handed to the browser as an httpOnly cookie with a 12-hour expiry. The reason it's sufficient is that **the browser never talks to Supabase**. In a typical Supabase app the frontend holds the anon key and calls the database directly, so Supabase's own auth has to be the gate — it's the only thing in the request path. Here the Express server is the only thing that ever holds that key; the browser only ever talks to this server's API. That makes a server-side session cookie a real gate rather than a decorative one, and it avoids wiring up Supabase Auth's email-confirmation flow for what is a single-operator admin page. The trade-offs are accepted and worth naming: one shared password rather than per-user accounts, no password reset flow, and no way to revoke an issued token before it expires — which is why the expiry is short.
+
 ## Security notes
 
 The `webhook_events` table has Row Level Security enabled with a policy permitting `INSERT` only for the `anon` role — no select, update, or delete. The ingest endpoint runs server-side but deliberately uses that low-privilege key, so a leaked key cannot be used to read or tamper with stored events.
@@ -124,11 +182,14 @@ SUPABASE_ANON_KEY=...
 DESTINATION_URL=...
 ```
 
+`ADMIN_PASSWORD_HASH` and `SESSION_SECRET` are added by `npm run setup:auth` — don't write those by hand.
+
 ## Running it
 
 ```bash
 npm install
-npm run dev     # starts the ingest HTTP server
+npm run setup:auth  # one-time: generates the dashboard password into .env.local
+npm run dev     # starts the ingest HTTP server + dashboard (http://localhost:3000)
 npm run worker  # starts the delivery worker (separate process)
 npm run dlq -- list          # inspect dead-lettered events
 npm run dlq -- replay <id>   # replay one back to pending
@@ -141,7 +202,7 @@ npm test        # runs the test suite
 1. Skeleton
 2. Ingest endpoint
 3. Delivery worker (backoff + jitter)
-4. Dead-letter queue + circuit breaker (current)
-5. Dashboard (auth + replay)
+4. Dead-letter queue + circuit breaker
+5. Dashboard (auth + replay) (current)
 6. CLI (localhost tunnel)
 7. Production polish

@@ -166,6 +166,39 @@ export function makeFakeSupabase(
           return { data: deadLettered, error: null };
         }
 
+        // Phase 5 dashboard reads (migration `add_dashboard_read_functions`).
+        // Probed live before writing the dashboard: p_status is optional and an
+        // unrecognised status simply matches nothing (no error), and the RPC
+        // returns full webhook_events rows, newest first.
+        case "list_webhook_events": {
+          const status = (args?.p_status ?? null) as string | null;
+          const limit = (args?.p_limit as number) ?? 100;
+          const matching = [...table.values()]
+            .filter((r) => status === null || r.status === status)
+            .slice(0, limit)
+            .map((r) => ({
+              ...r,
+              received_at: new Date().toISOString(),
+              updated_at: new Date().toISOString(),
+              next_attempt_at: null,
+            }));
+          return { data: matching, error: null };
+        }
+
+        // Live shape: destination_url, state, consecutive_failures, opened_at,
+        // next_probe_at, updated_at — one row per destination ever seen.
+        case "list_circuit_breakers": {
+          const all = [...breakers.entries()].map(([url, b]) => ({
+            destination_url: url,
+            state: b.state,
+            consecutive_failures: b.consecutiveFailures,
+            opened_at: b.state === "open" ? new Date().toISOString() : null,
+            next_probe_at: b.nextProbeAt,
+            updated_at: new Date().toISOString(),
+          }));
+          return { data: all, error: null };
+        }
+
         case "replay_webhook_event": {
           const row = table.get(args!.p_id as string);
           if (row && row.status === "dead_lettered") {

@@ -1,11 +1,16 @@
 import express from "express";
+import cookieParser from "cookie-parser";
+import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { getSupabase } from "./supabase";
+import { dashboardRouter } from "./dashboard";
+import { hasValidSession } from "./auth";
 
 // Separate from index.ts so tests can import the app without starting a real server.
 export const app = express();
 
 app.use(express.json());
+app.use(cookieParser());
 
 app.get("/health", (_req, res) => {
   res.json({ status: "ok" });
@@ -61,6 +66,21 @@ app.post("/webhooks/:source", async (req, res) => {
   }
 
   return res.status(202).json({ id, status: "pending" });
+});
+
+// Phase 5 dashboard. Mounted after the ingest routes so nothing here can shadow
+// them, and before express.static so that a stray public/api/... file could
+// never shadow the API. See Concepts/Express routing order.
+app.use("/api", dashboardRouter);
+
+// The dashboard page itself is served unprotected — it renders nothing until
+// its first fetch, and a fetch without a session gets a 401 and bounces the
+// browser to the login page. The session gate lives on the data, not the HTML.
+// Resolves to <project>/public from both src/ (tsx) and dist/ (compiled).
+app.use(express.static(path.join(__dirname, "..", "public")));
+
+app.get("/", (req, res) => {
+  res.redirect(hasValidSession(req) ? "/dashboard.html" : "/login.html");
 });
 
 // Catch-all error handler. Every error ends up here — nothing falls through to
