@@ -109,6 +109,20 @@ describe("POST /webhooks/:source", () => {
     expect(res.body.error).toBeTruthy();
   });
 
+  it("stores destination_url from DESTINATION_URL, or null when unset", async () => {
+    mocks.insert.mockResolvedValue({ error: null });
+
+    await request(app).post("/webhooks/stripe").send({ a: 1 });
+    let inserted = mocks.insert.mock.calls[0][0] as Record<string, unknown>;
+    expect(inserted.destination_url).toBeNull();
+
+    vi.stubEnv("DESTINATION_URL", "http://localhost:4000/receive");
+    await request(app).post("/webhooks/stripe").send({ a: 1 });
+    inserted = mocks.insert.mock.calls[1][0] as Record<string, unknown>;
+    expect(inserted.destination_url).toBe("http://localhost:4000/receive");
+    vi.unstubAllEnvs();
+  });
+
   it("returns 400 on an empty body and never touches the database", async () => {
     const res = await request(app).post("/webhooks/stripe").send({});
 
