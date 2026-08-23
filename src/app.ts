@@ -63,18 +63,25 @@ app.post("/webhooks/:source", async (req, res) => {
   return res.status(202).json({ id, status: "pending" });
 });
 
-// Turns express.json()'s malformed-JSON errors into a JSON response instead of
-// the default HTML one. Registered after the routes, so it only sees failures.
+// Catch-all error handler. Every error ends up here — nothing falls through to
+// Express's default HTML handler, which would leak a stack trace (and absolute
+// filesystem paths) to the client. Full detail goes to the server log instead.
 app.use(
   (
-    err: Error & { status?: number },
+    err: Error & { status?: number; statusCode?: number },
     _req: express.Request,
     res: express.Response,
-    next: express.NextFunction
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    _next: express.NextFunction
   ) => {
-    if (err instanceof SyntaxError && err.status === 400) {
-      return res.status(400).json({ error: "Invalid JSON body" });
-    }
-    return next(err);
+    const status = err.status || err.statusCode || 500;
+    const message =
+      status === 400
+        ? "Invalid JSON body"
+        : status === 413
+          ? "Payload too large"
+          : "Internal server error";
+    console.error(err);
+    res.status(status).json({ error: message });
   }
 );
