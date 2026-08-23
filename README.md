@@ -1,6 +1,6 @@
 # webhook-gateway
 
-A webhook ingest, delivery, and replay gateway. It's a portfolio project that demonstrates the parts of backend engineering most junior portfolios skip: retrying failed deliveries safely, avoiding duplicate side effects (idempotency), routing permanently-failed messages to a dead-letter queue, and using a circuit breaker to stop hammering a downstream service that's down.
+A webhook ingest, delivery, and replay gateway. It's a portfolio project that demonstrates. retrying failed deliveries safely, avoiding duplicate side effects (idempotency), routing permanently-failed messages to a dead-letter queue, and using a circuit breaker to stop hammering a downstream service that's down.
 
 Status: Phase 6 (CLI — one command starts everything and exposes it on a public URL).
 
