@@ -35,9 +35,38 @@ const defaultDeliver: DeliverFn = async (url, payload) => {
 
 export type BatchOutcome = {
   id: string;
-  outcome: "delivered" | "retry" | "dead_lettered";
+  outcome: "delivered" | "retry" | "dead_lettered" | "skipped";
   attempt: number;
 };
+
+type CircuitState = "closed" | "open";
+
+interface CircuitBreakerState {
+  state: CircuitState;
+  next_probe_at: string | null;
+}
+
+// get_circuit_breaker_state always returns exactly one row (even for a
+// destination with no breaker row yet, it synthesizes {closed, null}), as a
+// single-element array — confirmed empirically against the live RPC.
+async function getCircuitBreakerState(
+  supabase: SupabaseClient,
+  destinationUrl: string
+): Promise<CircuitBreakerState> {
+  const { data, error } = await supabase.rpc("get_circuit_breaker_state", {
+    p_destination_url: destinationUrl,
+  });
+
+  if (error) {
+    console.error(
+      `[worker] failed to read circuit breaker state for ${destinationUrl}: ${error.message}`
+    );
+    return { state: "closed", next_probe_at: null };
+  }
+
+  const row = (Array.isArray(data) ? data[0] : data) as CircuitBreakerState | undefined;
+  return row ?? { state: "closed", next_probe_at: null };
+}
 
 // Claims whatever's due, attempts delivery for each, and reports the outcome for
 // each row. Separated from the setInterval wrapper in worker.ts so it can be
@@ -67,6 +96,32 @@ export async function processPendingBatch(
       continue;
     }
 
+    const breaker = await getCircuitBreakerState(supabase, row.destination_url);
+
+    if (breaker.state === "open") {
+      const probeDue =
+        !breaker.next_probe_at || Date.parse(breaker.next_probe_at) <= Date.now();
+
+      if (!probeDue) {
+        const { error: skipError } = await supabase.rpc("mark_webhook_event_skipped", {
+          p_id: row.id,
+          p_next_attempt_at: breaker.next_probe_at,
+        });
+        if (skipError) {
+          console.error(`[worker] event ${row.id}: failed to mark skipped (${skipError.message})`);
+        }
+        console.log(
+          `[worker] circuit open for ${row.destination_url}, skipping event ${row.id} until ${breaker.next_probe_at}`
+        );
+        results.push({ id: row.id, outcome: "skipped", attempt: row.attempts });
+        continue;
+      }
+
+      console.log(
+        `[worker] circuit open for ${row.destination_url} but cooldown elapsed, attempting probe delivery for event ${row.id}`
+      );
+    }
+
     let result: DeliverResult;
     try {
       result = await deliver(row.destination_url, row.payload);
@@ -84,6 +139,14 @@ export async function processPendingBatch(
       if (markError) {
         console.error(`[worker] event ${row.id}: failed to mark delivered (${markError.message})`);
       }
+      const { error: successError } = await supabase.rpc("record_delivery_success", {
+        p_destination_url: row.destination_url,
+      });
+      if (successError) {
+        console.error(
+          `[worker] failed to record delivery success for ${row.destination_url}: ${successError.message}`
+        );
+      }
       console.log(`[worker] event ${row.id} attempt ${attemptNumber}: delivered`);
       results.push({ id: row.id, outcome: "delivered", attempt: attemptNumber });
     } else {
@@ -93,6 +156,14 @@ export async function processPendingBatch(
         );
       }
       results.push(await retryOrDeadLetter(supabase, row, attemptNumber));
+      const { error: failureError } = await supabase.rpc("record_delivery_failure", {
+        p_destination_url: row.destination_url,
+      });
+      if (failureError) {
+        console.error(
+          `[worker] failed to record delivery failure for ${row.destination_url}: ${failureError.message}`
+        );
+      }
     }
   }
 
