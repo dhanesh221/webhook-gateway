@@ -1,52 +1,8 @@
 import { describe, it, expect, afterEach } from "vitest";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
-import type { SupabaseClient } from "@supabase/supabase-js";
-import { processPendingBatch, ClaimedWebhookEvent } from "../src/deliveryWorker";
-
-// A tiny in-memory stand-in for the three RPCs the worker calls, modeling the
-// real behavior verified live against Supabase: claim_pending_webhook_events
-// returns pending rows and flips them to in_progress; mark_webhook_event_retry
-// increments attempts and dead-letters once attempts reaches p_max_attempts.
-// Timing (next_attempt_at) is intentionally ignored here — the real DB enforces
-// that gate, and tests only need to drive processPendingBatch call-by-call
-// without waiting on real timers.
-function makeFakeSupabase(rows: ClaimedWebhookEvent[]) {
-  const table = new Map(rows.map((r) => [r.id, { ...r, status: "pending" as string }]));
-
-  const client = {
-    rpc: async (fn: string, args?: Record<string, unknown>) => {
-      if (fn === "claim_pending_webhook_events") {
-        const claimed: ClaimedWebhookEvent[] = [];
-        for (const row of table.values()) {
-          if (row.status === "pending") {
-            row.status = "in_progress";
-            claimed.push({ ...row });
-          }
-        }
-        return { data: claimed, error: null };
-      }
-
-      if (fn === "mark_webhook_event_delivered") {
-        const row = table.get(args!.p_id as string)!;
-        row.status = "delivered";
-        return { data: null, error: null };
-      }
-
-      if (fn === "mark_webhook_event_retry") {
-        const row = table.get(args!.p_id as string)!;
-        row.attempts += 1;
-        const maxAttempts = (args!.p_max_attempts as number) ?? 5;
-        row.status = row.attempts >= maxAttempts ? "dead_lettered" : "pending";
-        return { data: null, error: null };
-      }
-
-      throw new Error(`unexpected rpc call: ${fn}`);
-    },
-  };
-
-  return { client: client as unknown as SupabaseClient, table };
-}
+import { processPendingBatch } from "../src/deliveryWorker";
+import { makeFakeSupabase } from "./fakeSupabase";
 
 describe("processPendingBatch", () => {
   let server: http.Server | undefined;

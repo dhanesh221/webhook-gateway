@@ -2,7 +2,7 @@
 
 A webhook ingest, delivery, and replay gateway. It's a portfolio project that demonstrates the parts of backend engineering most junior portfolios skip: retrying failed deliveries safely, avoiding duplicate side effects (idempotency), routing permanently-failed messages to a dead-letter queue, and using a circuit breaker to stop hammering a downstream service that's down.
 
-Status: Phase 3 (Delivery worker).
+Status: Phase 4 (Dead-letter queue + circuit breaker).
 
 ## Stack
 
@@ -79,6 +79,35 @@ delay = random(0, min(maxDelay, baseDelay * 2^attempt))
 
 With `baseDelay = 1000ms` and `maxDelay = 5 minutes`: the first retry waits up to 1s, the second up to 2s, the third up to 4s, and so on, capping at 5 minutes once the exponent gets large. After 5 attempts total, the event is dead-lettered rather than retried again.
 
+## Circuit breaker (Phase 4)
+
+Backoff alone doesn't stop the worker from hammering a destination that's entirely down: each event still retries on its own schedule, and with enough concurrent events that adds up to steady traffic against a dead service. A circuit breaker tracks failures *per destination* (not per event) and, once a destination looks reliably down, stops sending it traffic for a cooldown period — giving it room to recover instead of getting retried into the ground.
+
+State lives in a `circuit_breakers` table (one row per `destination_url`), managed entirely through `SECURITY DEFINER` RPCs — nothing touches the table directly. There's no stored "half-open" state; it's derived: once a breaker is `open` and its cooldown (`next_probe_at`) has passed, the next event claimed for that destination is treated as a probe attempt instead of being skipped.
+
+Before attempting delivery, the worker checks `get_circuit_breaker_state(destination_url)`:
+
+- **`closed`** — deliver normally.
+- **`open`, cooldown not yet elapsed** — don't attempt delivery. Call `mark_webhook_event_skipped`, which puts the event back to `pending` with a new `next_attempt_at` *without* incrementing its `attempts` count — being skipped isn't a failed delivery attempt, so it shouldn't count against the event's own retry budget.
+- **`open`, cooldown elapsed** — attempt delivery anyway, as a probe.
+
+After every real delivery attempt (including probes): success calls `record_delivery_success` (resets the breaker to `closed`); failure calls `record_delivery_failure`, which increments a failure counter and flips the breaker to `open` (with a fresh cooldown) once it crosses the threshold. Defaults, applied by the RPCs themselves: **5 consecutive failures** trips the breaker, **60 second** cooldown.
+
+Because the failure counter is per-destination, not per-event, a handful of different events all failing against the same flaky destination trips the breaker exactly like one event failing repeatedly would.
+
+## Dead-letter queue (Phase 4)
+
+Events that exhaust their 5 delivery attempts land in `status = 'dead_lettered'` and stop being retried automatically. A small CLI inspects and replays them:
+
+```bash
+npm run dlq -- list
+npm run dlq -- replay <event-id>
+```
+
+`list` prints every dead-lettered event's id, source, attempts, and last-updated time. `replay <id>` resets a dead-lettered event back to `pending` with `attempts = 0`, so the worker picks it up again on its next poll.
+
+**Implementation note:** `replay_webhook_event` returns no signal either way — calling it on a real dead-lettered row and on a nonexistent id both come back as `{ data: null, error: null }` (confirmed empirically against the live RPC before writing the CLI). So `replay` checks `list_dead_lettered_events` itself first to decide whether to report success or a clear "not dead-lettered (not found, or already replayed)" message, rather than trusting the RPC's return value.
+
 ## Security notes
 
 The `webhook_events` table has Row Level Security enabled with a policy permitting `INSERT` only for the `anon` role — no select, update, or delete. The ingest endpoint runs server-side but deliberately uses that low-privilege key, so a leaked key cannot be used to read or tamper with stored events.
@@ -101,6 +130,8 @@ DESTINATION_URL=...
 npm install
 npm run dev     # starts the ingest HTTP server
 npm run worker  # starts the delivery worker (separate process)
+npm run dlq -- list          # inspect dead-lettered events
+npm run dlq -- replay <id>   # replay one back to pending
 npm test        # runs the test suite
 ```
 
@@ -110,7 +141,7 @@ npm test        # runs the test suite
 1. Skeleton
 2. Ingest endpoint
 3. Delivery worker (backoff + jitter)
-4. Dead-letter queue + circuit breaker
+4. Dead-letter queue + circuit breaker (current)
 5. Dashboard (auth + replay)
 6. CLI (localhost tunnel)
 7. Production polish
