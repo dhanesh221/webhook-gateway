@@ -130,4 +130,23 @@ describe("POST /webhooks/:source", () => {
     expect(res.body.error).toBeTruthy();
     expect(mocks.insert).not.toHaveBeenCalled();
   });
+
+  it("returns a clean JSON 413 with no stack trace for an oversized body", async () => {
+    // Express's default body limit is 100kb; this payload exceeds it, which
+    // previously fell through to Express's default HTML error handler and
+    // leaked a stack trace with absolute filesystem paths. See
+    // Failures/error-handler-leaks-stack-trace.md.
+    const oversized = { data: "x".repeat(200 * 1024) };
+
+    const res = await request(app).post("/webhooks/stripe").send(oversized);
+
+    expect(res.status).toBe(413);
+    expect(res.type).toBe("application/json");
+    expect(res.body).toEqual({ error: "Payload too large" });
+
+    const raw = JSON.stringify(res.body);
+    expect(raw).not.toMatch(/at \w+ \(/); // stack frame shape
+    expect(raw).not.toContain(process.cwd());
+    expect(mocks.insert).not.toHaveBeenCalled();
+  });
 });
