@@ -165,3 +165,46 @@ describe("gateway dlq — through the unified CLI", () => {
     errorSpy.mockRestore();
   });
 });
+
+// Regression: padEnd sets a minimum width but never truncates, so a long source
+// shifted every column to its right and made ATTEMPTS ambiguous — in the tool an
+// operator reads during an incident.
+// See Failures/dlq-list-columns-collide-on-long-source.md
+describe("dlq list column alignment", () => {
+  it("keeps columns aligned when a source is longer than its column", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    mocks.rpc.mockResolvedValue({
+      data: [
+        {
+          id: "11111111-2222-3333-4444-555555555555",
+          source: "short",
+          attempts: 5,
+          updated_at: "2026-08-23T00:00:00.000Z",
+        },
+        {
+          id: "66666666-7777-8888-9999-000000000000",
+          source: "probe-hang2-17874604435-way-too-long",
+          attempts: 5,
+          updated_at: "2026-08-23T00:00:00.000Z",
+        },
+      ],
+      error: null,
+    });
+
+    await list();
+
+    const lines = logSpy.mock.calls.map((c) => c.join(" "));
+    const [header, shortRow, longRow] = lines;
+
+    // Every row starts its UPDATED_AT column at the same offset as the header.
+    const updatedAtColumn = header.indexOf("UPDATED_AT");
+    expect(shortRow.indexOf("2026-08-23T00:00:00.000Z")).toBe(updatedAtColumn);
+    expect(longRow.indexOf("2026-08-23T00:00:00.000Z")).toBe(updatedAtColumn);
+
+    // The long source is visibly truncated rather than pushing the row wider.
+    expect(longRow).toContain("…");
+    expect(longRow.length).toBe(shortRow.length);
+
+    logSpy.mockRestore();
+  });
+});

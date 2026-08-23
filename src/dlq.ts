@@ -18,6 +18,21 @@ interface DeadLetteredEvent {
 // Large enough that a real not-found lookup isn't hidden behind list truncation.
 const LIST_ALL_LIMIT = 10_000;
 
+const ID_WIDTH = 36;
+const SOURCE_WIDTH = 16;
+const ATTEMPTS_WIDTH = 8;
+
+// padEnd sets a *minimum* width and never truncates, so a source longer than its
+// column shifted every column to its right — making ATTEMPTS ambiguous in the one
+// tool an operator reads during an incident. fit() enforces the width in both
+// directions, so every row is exactly as wide as its header.
+export function fit(value: string, width: number): string {
+  if (value.length <= width) return value.padEnd(width);
+  // Reserve the final character for the ellipsis so the column width stays exact
+  // and it's visible that the value was cut rather than being genuinely short.
+  return value.slice(0, width - 1) + "…";
+}
+
 export async function list(limit = 50): Promise<void> {
   const { data, error } = await getSupabase().rpc("list_dead_lettered_events", {
     p_limit: limit,
@@ -36,10 +51,13 @@ export async function list(limit = 50): Promise<void> {
     return;
   }
 
-  console.log(`${"ID".padEnd(38)}${"SOURCE".padEnd(16)}${"ATTEMPTS".padEnd(10)}UPDATED_AT`);
+  console.log(
+    `${fit("ID", ID_WIDTH)} ${fit("SOURCE", SOURCE_WIDTH)} ${fit("ATTEMPTS", ATTEMPTS_WIDTH)} UPDATED_AT`
+  );
   for (const row of rows) {
     console.log(
-      `${row.id.padEnd(38)}${row.source.padEnd(16)}${String(row.attempts).padEnd(10)}${row.updated_at}`
+      `${fit(row.id, ID_WIDTH)} ${fit(row.source, SOURCE_WIDTH)} ` +
+        `${fit(String(row.attempts), ATTEMPTS_WIDTH)} ${row.updated_at}`
     );
   }
 }

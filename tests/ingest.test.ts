@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import request from "supertest";
 
 // Stand-in for the Supabase call chain: from(...).insert(...)
@@ -13,7 +13,8 @@ vi.mock("../src/supabase", () => ({
   getSupabase: () => ({ from: mocks.from }),
 }));
 
-import { app } from "../src/app";
+import { app, MAX_BODY_BYTES } from "../src/app";
+import { buildSignatureHeader, SIGNATURE_HEADER } from "../src/signature";
 
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -132,11 +133,12 @@ describe("POST /webhooks/:source", () => {
   });
 
   it("returns a clean JSON 413 with no stack trace for an oversized body", async () => {
-    // Express's default body limit is 100kb; this payload exceeds it, which
-    // previously fell through to Express's default HTML error handler and
+    // Oversizing is derived from the exported limit rather than hardcoded, so
+    // this test keeps testing the boundary if the limit is ever retuned.
+    // Previously this fell through to Express's default HTML error handler and
     // leaked a stack trace with absolute filesystem paths. See
     // Failures/error-handler-leaks-stack-trace.md.
-    const oversized = { data: "x".repeat(200 * 1024) };
+    const oversized = { data: "x".repeat(MAX_BODY_BYTES + 1024) };
 
     const res = await request(app).post("/webhooks/stripe").send(oversized);
 
@@ -148,5 +150,126 @@ describe("POST /webhooks/:source", () => {
     expect(raw).not.toMatch(/at \w+ \(/); // stack frame shape
     expect(raw).not.toContain(process.cwd());
     expect(mocks.insert).not.toHaveBeenCalled();
+  });
+});
+
+describe("source validation", () => {
+  beforeEach(() => {
+    mocks.insert.mockResolvedValue({ error: null });
+  });
+
+  // Live probing in Phase 2 showed %2E%2E%2F… decoded to `../../etc` and was
+  // stored verbatim. Inert then, but `source` is half the idempotency identity
+  // and appears in dashboard URLs.
+  it.each([
+    ["encoded traversal", "%2E%2E%2F%2E%2E%2Fetc"],
+    ["encoded slash", "stripe%2Fevil"],
+    ["empty-ish", "%20"],
+    ["too long", "s".repeat(65)],
+  ])("rejects %s with 400 and never inserts", async (_label, source) => {
+    const res = await request(app).post(`/webhooks/${source}`).send({ a: 1 });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBeTruthy();
+    expect(mocks.insert).not.toHaveBeenCalled();
+  });
+
+  it.each(["stripe", "github-events", "my_source", "s".repeat(64)])(
+    "accepts %s",
+    async (source) => {
+      const res = await request(app).post(`/webhooks/${source}`).send({ a: 1 });
+      expect(res.status).toBe(202);
+    }
+  );
+});
+
+describe("signature verification", () => {
+  const SECRET = "whsec_test_secret";
+  const BODY = JSON.stringify({ event: "payment.succeeded", amount: 500 });
+
+  beforeEach(() => {
+    mocks.insert.mockResolvedValue({ error: null });
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  function post(rawBody: string, header?: string) {
+    const req = request(app)
+      .post("/webhooks/stripe")
+      .set("Content-Type", "application/json");
+    if (header) req.set(SIGNATURE_HEADER, header);
+    return req.send(rawBody);
+  }
+
+  it("accepts unsigned requests when no secret is configured", async () => {
+    const res = await post(BODY);
+
+    expect(res.status).toBe(202);
+    expect(mocks.insert).toHaveBeenCalledTimes(1);
+  });
+
+  it("accepts a correctly signed request when a secret is configured", async () => {
+    vi.stubEnv("WEBHOOK_SIGNING_SECRET", SECRET);
+    const now = Math.floor(Date.now() / 1000);
+
+    const res = await post(BODY, buildSignatureHeader(SECRET, now, BODY));
+
+    expect(res.status).toBe(202);
+    expect(mocks.insert).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects an unsigned request once a secret is configured", async () => {
+    vi.stubEnv("WEBHOOK_SIGNING_SECRET", SECRET);
+
+    const res = await post(BODY);
+
+    expect(res.status).toBe(401);
+    expect(mocks.insert).not.toHaveBeenCalled();
+  });
+
+  it("rejects a body tampered with after signing", async () => {
+    vi.stubEnv("WEBHOOK_SIGNING_SECRET", SECRET);
+    const now = Math.floor(Date.now() / 1000);
+    const header = buildSignatureHeader(SECRET, now, BODY);
+
+    // Same signature, different body — the amount has been altered in transit.
+    const tampered = JSON.stringify({ event: "payment.succeeded", amount: 999999 });
+    const res = await post(tampered, header);
+
+    expect(res.status).toBe(401);
+    expect(mocks.insert).not.toHaveBeenCalled();
+  });
+
+  it("rejects a signature signed with the wrong secret", async () => {
+    vi.stubEnv("WEBHOOK_SIGNING_SECRET", SECRET);
+    const now = Math.floor(Date.now() / 1000);
+
+    const res = await post(BODY, buildSignatureHeader("wrong-secret", now, BODY));
+
+    expect(res.status).toBe(401);
+    expect(mocks.insert).not.toHaveBeenCalled();
+  });
+
+  it("rejects a replayed request whose timestamp is outside tolerance", async () => {
+    vi.stubEnv("WEBHOOK_SIGNING_SECRET", SECRET);
+    // Correctly signed, but captured an hour ago.
+    const old = Math.floor(Date.now() / 1000) - 3600;
+
+    const res = await post(BODY, buildSignatureHeader(SECRET, old, BODY));
+
+    expect(res.status).toBe(401);
+    expect(mocks.insert).not.toHaveBeenCalled();
+  });
+
+  it("never tells the caller why the signature failed", async () => {
+    vi.stubEnv("WEBHOOK_SIGNING_SECRET", SECRET);
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const res = await post(BODY, "t=1,v1=deadbeef");
+
+    // A specific reason would help an attacker iterate toward a forgery.
+    expect(res.body).toEqual({ error: "Invalid signature" });
   });
 });
