@@ -1,6 +1,6 @@
 # webhook-gateway
 
-A webhook ingest, delivery, and replay gateway. It's a portfolio project that demonstrates. retrying failed deliveries safely, avoiding duplicate side effects (idempotency), routing permanently-failed messages to a dead-letter queue, and using a circuit breaker to stop hammering a downstream service that's down.
+A webhook ingest, delivery, and replay gateway. It receives webhook events over HTTP, stores them durably, and delivers them onward to a destination. Failed deliveries are retried with exponential backoff, duplicate events are rejected by an idempotency key, permanently-failed messages are routed to a dead-letter queue for inspection and manual replay, and a circuit breaker stops delivery attempts against a destination that is down.
 
 Status: Phase 6 (CLI — one command starts everything and exposes it on a public URL).
 
@@ -11,7 +11,7 @@ npm run gateway -- start
 ## Stack
 
 - **Node.js + TypeScript** — typed JavaScript, catches whole classes of bugs before the code even runs.
-- **Express** — the most common Node.js web server framework, and the one interviewers ask about most.
+- **Express** — HTTP server framework for the ingest endpoint, dashboard, and API routes.
 - **Supabase (Postgres)** — stores received webhook events.
 - **Vitest** — the test runner. Chosen over Jest because it needs almost no configuration to work with TypeScript, and it's fast.
 - **Supertest** — lets tests call HTTP endpoints directly, without starting a real server on a real port.
@@ -157,7 +157,7 @@ npm run dev
 - **`/login.html`** — password form; posts to `/api/login` and redirects to the dashboard on success.
 - **`/dashboard.html`** — a status filter, a table of the 100 most recent events (id, source, status, attempts, received), a circuit breakers table (destination, state, consecutive failures, next probe), and a **Replay** button on dead-lettered rows. Any fetch that comes back `401` bounces the browser to the login page.
 
-Plain HTML and vanilla JavaScript, no build step and no framework — the interesting parts of this project are behind the API, not in front of it.
+Plain HTML and vanilla JavaScript, no build step and no framework — the dashboard is a thin view over the API.
 
 ### API routes
 
