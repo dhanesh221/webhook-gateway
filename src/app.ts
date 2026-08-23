@@ -30,6 +30,10 @@ app.post("/webhooks/:source", async (req, res) => {
   // uuid client-side lets us report it while keeping the anon key read-blocked.
   const id = randomUUID();
 
+  // Read at request time (not module load) so importing app.ts never requires
+  // env vars — same reasoning as getSupabase()'s lazy init.
+  const destinationUrl = process.env.DESTINATION_URL || null;
+
   const { error } = await getSupabase()
     .from("webhook_events")
     .insert({
@@ -39,6 +43,7 @@ app.post("/webhooks/:source", async (req, res) => {
       headers: req.headers,
       payload,
       status: "pending",
+      destination_url: destinationUrl,
     });
 
   if (error) {
