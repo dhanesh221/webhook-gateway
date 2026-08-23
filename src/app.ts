@@ -1,8 +1,75 @@
 import express from "express";
+import { randomUUID } from "node:crypto";
+import { getSupabase } from "./supabase";
 
 // Separate from index.ts so tests can import the app without starting a real server.
 export const app = express();
 
+app.use(express.json());
+
 app.get("/health", (_req, res) => {
   res.json({ status: "ok" });
 });
+
+// Receives a webhook from an external provider and stores it for later delivery.
+// Responds immediately — actual delivery is the Phase 3 worker's job.
+app.post("/webhooks/:source", async (req, res) => {
+  const source = req.params.source;
+  const idempotencyKey = req.header("Idempotency-Key") || null;
+  const payload = req.body;
+
+  if (!payload || typeof payload !== "object" || Object.keys(payload).length === 0) {
+    return res
+      .status(400)
+      .json({ error: "Request body must be a non-empty JSON object" });
+  }
+
+  // The id is generated here rather than read back from the database. The table's
+  // RLS policy grants INSERT only, and asking Postgres to RETURN the new row needs
+  // SELECT rights — so `.select()` after an insert fails with 42501. Generating the
+  // uuid client-side lets us report it while keeping the anon key read-blocked.
+  const id = randomUUID();
+
+  const { error } = await getSupabase()
+    .from("webhook_events")
+    .insert({
+      id,
+      source,
+      idempotency_key: idempotencyKey,
+      headers: req.headers,
+      payload,
+      status: "pending",
+    });
+
+  if (error) {
+    // 23505 is Postgres' unique_violation. Here it means the unique index on
+    // (source, idempotency_key) rejected a webhook we already stored. Providers
+    // redeliver routinely, so this is expected traffic, not a failure — we
+    // acknowledge it so the provider stops retrying.
+    if (error.code === "23505") {
+      return res
+        .status(200)
+        .json({ status: "duplicate", message: "already received" });
+    }
+
+    return res.status(500).json({ error: "Failed to store webhook event" });
+  }
+
+  return res.status(202).json({ id, status: "pending" });
+});
+
+// Turns express.json()'s malformed-JSON errors into a JSON response instead of
+// the default HTML one. Registered after the routes, so it only sees failures.
+app.use(
+  (
+    err: Error & { status?: number },
+    _req: express.Request,
+    res: express.Response,
+    next: express.NextFunction
+  ) => {
+    if (err instanceof SyntaxError && err.status === 400) {
+      return res.status(400).json({ error: "Invalid JSON body" });
+    }
+    return next(err);
+  }
+);
