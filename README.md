@@ -31,12 +31,19 @@ Receives a webhook from an external provider (`:source` is a label such as `stri
 
 Send a JSON body. Optionally send an `Idempotency-Key` header.
 
+`:source` must be 1–64 characters of letters, digits, hyphen or underscore. It is a label, not free text: it forms half of the idempotency identity and appears in dashboard URLs, so anything outside that set is rejected rather than stored.
+
 | Situation | Status | Body |
 |---|---|---|
 | Stored successfully | `202` | `{ "id": "<uuid>", "status": "pending" }` |
 | Already received (same source + `Idempotency-Key`) | `200` | `{ "status": "duplicate", "message": "already received" }` |
 | Empty or non-object JSON body | `400` | `{ "error": "..." }` |
 | Malformed JSON | `400` | `{ "error": "Invalid JSON body" }` |
+| Invalid `:source` | `400` | `{ "error": "Source must be ..." }` |
+| Signature required and missing/invalid | `401` | `{ "error": "Invalid signature" }` |
+| Body larger than 1 MB | `413` | `{ "error": "Payload too large" }` |
+
+The body limit is 1 MB, chosen deliberately. Express defaults to 100 KB, which this project relied on by accident until it was measured; real providers occasionally exceed that.
 
 ```bash
 curl -X POST http://localhost:3000/webhooks/stripe \
@@ -251,6 +258,28 @@ Signature verification is **not** implemented — this accepts any POST to `/web
 
 `localtunnel@2.0.2` pulls in an old `axios` with open high-severity advisories (`npm audit`). It is a development-only convenience that never runs in production, so it is accepted here rather than pinned around — but it is a real reason not to promote this dependency into a production path.
 
+## Signature verification (Phase 7)
+
+Until Phase 7, `/webhooks/:source` accepted any POST from anyone who learned the URL. Set `WEBHOOK_SIGNING_SECRET` and it will only accept requests carrying a valid HMAC signature.
+
+Senders supply a header in the format Stripe and GitHub use:
+
+```
+X-Webhook-Signature: t=1800000000,v1=<hex sha256 hmac>
+```
+
+where the HMAC is computed over the string `` `${t}.${rawBody}` `` using the shared secret.
+
+Three details in that scheme each defend against a specific attack, and they're worth being able to explain:
+
+- **The timestamp is signed together with the body.** Signing the body alone would make a captured request replayable forever, because its signature never expires. Binding a timestamp in means a capture goes stale — requests more than 5 minutes off the server clock (in either direction, which also covers a badly skewed sender) are rejected.
+- **The signature is computed over the raw bytes as received**, not over a re-serialised object. `JSON.stringify(JSON.parse(body))` can reorder keys or change whitespace, producing a different HMAC and rejecting perfectly valid requests. The raw body is captured in `express.json()`'s `verify` hook for exactly this reason.
+- **Comparison is constant-time** (`crypto.timingSafeEqual`). A plain `===` returns on the first differing byte, so an attacker can measure response times to discover a valid signature one byte at a time.
+
+The rejection reason (`missing signature header`, `signature mismatch`, `signature timestamp outside tolerance`) is written to the server log but never returned to the caller — telling someone *why* their signature failed helps them iterate toward a forgery. Clients always get the same `401 Invalid signature`.
+
+**When `WEBHOOK_SIGNING_SECRET` is unset, verification is disabled** and unsigned requests are accepted. That's convenient locally and dangerous anywhere else, so the server logs a warning on every startup in that state.
+
 ## Security notes
 
 The `webhook_events` table has Row Level Security enabled with a policy permitting `INSERT` only for the `anon` role — no select, update, or delete. The ingest endpoint runs server-side but deliberately uses that low-privilege key, so a leaked key cannot be used to read or tamper with stored events.
@@ -265,6 +294,7 @@ Copy the required values into `.env.local` (gitignored, never committed):
 SUPABASE_URL=...
 SUPABASE_ANON_KEY=...
 DESTINATION_URL=...
+WEBHOOK_SIGNING_SECRET=...   # optional; when set, incoming webhooks must be signed
 ```
 
 `ADMIN_PASSWORD_HASH` and `SESSION_SECRET` are added by `npm run setup:auth` — don't write those by hand.

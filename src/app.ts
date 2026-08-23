@@ -5,11 +5,37 @@ import { randomUUID } from "node:crypto";
 import { getSupabase } from "./supabase";
 import { dashboardRouter } from "./dashboard";
 import { hasValidSession } from "./auth";
+import { verifySignature, SIGNATURE_HEADER } from "./signature";
+
+// Chosen deliberately rather than inherited. express.json() defaults to 100 KB,
+// which this project relied on by accident until it was measured; real providers
+// occasionally exceed that. 1 MB accommodates them while still bounding how much
+// memory one request can consume.
+export const MAX_BODY_BYTES = 1024 * 1024;
+
+// `source` is a label, not free text. It becomes half of the idempotency identity
+// and appears in dashboard URLs, so it is constrained to characters that are
+// unambiguous in both roles. Unvalidated, it accepted values like `../../etc`.
+export const SOURCE_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+
+// Requests carry their raw bytes through for signature verification. The signature
+// is computed over exactly what was sent — re-serialising the parsed object can
+// reorder keys or alter whitespace and would break otherwise-valid signatures.
+interface RawBodyRequest extends express.Request {
+  rawBody?: string;
+}
 
 // Separate from index.ts so tests can import the app without starting a real server.
 export const app = express();
 
-app.use(express.json());
+app.use(
+  express.json({
+    limit: MAX_BODY_BYTES,
+    verify: (req, _res, buf) => {
+      (req as RawBodyRequest).rawBody = buf.toString("utf8");
+    },
+  })
+);
 app.use(cookieParser());
 
 app.get("/health", (_req, res) => {
@@ -22,6 +48,31 @@ app.post("/webhooks/:source", async (req, res) => {
   const source = req.params.source;
   const idempotencyKey = req.header("Idempotency-Key") || null;
   const payload = req.body;
+
+  if (!SOURCE_PATTERN.test(source)) {
+    return res.status(400).json({
+      error: "Source must be 1-64 characters of letters, digits, hyphen or underscore",
+    });
+  }
+
+  // Verification is enabled by the presence of a secret. When none is set the
+  // endpoint accepts unsigned requests, which is convenient for local testing and
+  // dangerous anywhere else — startServer() logs a warning in that case.
+  const signingSecret = process.env.WEBHOOK_SIGNING_SECRET;
+  if (signingSecret) {
+    const result = verifySignature({
+      secret: signingSecret,
+      header: req.header(SIGNATURE_HEADER),
+      rawBody: (req as RawBodyRequest).rawBody ?? "",
+    });
+
+    if (!result.ok) {
+      // The reason is logged but never returned: telling a caller *why* their
+      // signature failed helps them iterate toward a forgery.
+      console.warn(`[ingest] rejected ${source}: ${result.reason}`);
+      return res.status(401).json({ error: "Invalid signature" });
+    }
+  }
 
   if (!payload || typeof payload !== "object" || Object.keys(payload).length === 0) {
     return res
