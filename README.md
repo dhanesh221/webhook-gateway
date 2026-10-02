@@ -1,330 +1,151 @@
 # webhook-gateway
 
-A webhook ingest, delivery, and replay gateway. It receives webhook events over HTTP, stores them durably, and delivers them onward to a destination. Failed deliveries are retried with exponential backoff, duplicate events are rejected by an idempotency key, permanently-failed messages are routed to a dead-letter queue for inspection and manual replay, and a circuit breaker stops delivery attempts against a destination that is down.
+An HTTP webhook ingest, delivery, and replay gateway. It stores accepted events in Supabase/Postgres, delivers them to registered source destinations, retries failures with jittered backoff, holds exhausted events in a dead-letter queue, and provides a dashboard for inspection and replay.
 
-Status: Phase 6 (CLI — one command starts everything and exposes it on a public URL).
+Status: Phase 7, production-polish work. Phase 6 (CLI + development tunnel) is complete. This is a single-operator gateway, not a multi-tenant service or a claim of production readiness.
 
-```bash
-npm run gateway -- start
-```
+## Delivery contract
 
-## Stack
+Ingest returns `202` after an event is stored. An optional `Idempotency-Key` deduplicates ingest within a source; a duplicate returns `200`. Without that header, repeated requests are separate events. The worker makes up to five attempts, with full-jitter exponential waits capped at five minutes. Failed events enter the DLQ, where they can be replayed.
 
-- **Node.js + TypeScript** — typed JavaScript, catches whole classes of bugs before the code even runs.
-- **Express** — HTTP server framework for the ingest endpoint, dashboard, and API routes.
-- **Supabase (Postgres)** — stores received webhook events.
-- **Vitest** — the test runner. Chosen over Jest because it needs almost no configuration to work with TypeScript, and it's fast.
-- **Supertest** — lets tests call HTTP endpoints directly, without starting a real server on a real port.
-- **bcryptjs + jsonwebtoken** — dashboard auth (Phase 5): bcrypt hashes the admin password so the stored value can't be reversed; JWT signs the session cookie so the server can trust it without keeping a session table.
-- **commander** — CLI subcommand parsing (Phase 6): `gateway start`, `gateway dlq list`, `gateway dlq replay <id>`, and a real `--help`.
-- **localtunnel** — gives the local server a public HTTPS URL so a real webhook sender can reach it during development. See [CLI and public tunnel](#cli-and-public-tunnel-phase-6) for why this and not `cloudflared`.
+Delivery is **at least once**, not exactly once. If the destination accepts an event but the gateway fails before recording success, a retry may repeat the side effect. Downstream applications must implement their own deduplication. There is also no automatic recovery of an `in_progress` event abandoned by a crashed worker in the current database RPC contract. Review that before relying on unattended operation.
 
-## Endpoints
+Circuit breakers are shared by destination URL: five consecutive failures open a breaker for 60 seconds, then a delivery probes it. Breaker skips do not consume event attempts. Sources using the same URL share a breaker.
 
-### `GET /health`
+## Phase A changes
 
-Returns `200` with `{ "status": "ok" }`.
+### Registered sources and routing
 
-### `POST /webhooks/:source`
+`webhook_sources` stores `name`, `destination_url`, `secret_env`, `enabled`, and `updated_at`. Each source has one destination. The destination is copied into the event when it is received. Updating or disabling a source affects new ingest only: queued events and DLQ replays keep their original destination. Disabling a source does not cancel queued delivery.
 
-Receives a webhook from an external provider (`:source` is a label such as `stripe` or `github`), stores it, and returns immediately. Actual delivery to downstream targets is the Phase 3 worker's job.
+The signing secret itself is **not in the database**. `secret_env` references a server environment variable such as `WG_SOURCE_PAYMENTS_SECRET`. Its name must match `WG_SOURCE_[A-Z0-9_]+_SECRET`, and its value must contain at least 32 UTF-8 bytes. Generate a high-entropy value, not a 32-character human password. Use a different variable and secret for every source. The name convention does not enforce uniqueness across rows; operators are responsible for not sharing a secret.
 
-Send a JSON body. Optionally send an `Idempotency-Key` header.
-
-`:source` must be 1–64 characters of letters, digits, hyphen or underscore. It is a label, not free text: it forms half of the idempotency identity and appears in dashboard URLs, so anything outside that set is rejected rather than stored.
-
-| Situation | Status | Body |
-|---|---|---|
-| Stored successfully | `202` | `{ "id": "<uuid>", "status": "pending" }` |
-| Already received (same source + `Idempotency-Key`) | `200` | `{ "status": "duplicate", "message": "already received" }` |
-| Empty or non-object JSON body | `400` | `{ "error": "..." }` |
-| Malformed JSON | `400` | `{ "error": "Invalid JSON body" }` |
-| Invalid `:source` | `400` | `{ "error": "Source must be ..." }` |
-| Signature required and missing/invalid | `401` | `{ "error": "Invalid signature" }` |
-| Body larger than 1 MB | `413` | `{ "error": "Payload too large" }` |
-
-The body limit is 1 MB, chosen deliberately. Express defaults to 100 KB, which this project relied on by accident until it was measured; real providers occasionally exceed that.
+Destinations must be HTTPS. Loopback HTTP (`localhost`, `127.0.0.1`, or `::1`) is allowed only outside `NODE_ENV=production`. Embedded URL credentials and fragments are rejected. Only trusted operators may manage sources. This URL check is not an SSRF sandbox: DNS can resolve public-looking names to private addresses, and delivery follows redirects. Do not expose source management to untrusted tenants. Multi-subscriber routing should add a subscriptions table and separate per-subscriber delivery records, rather than treating one event's status as the status of several deliveries.
 
 ```bash
-curl -X POST http://localhost:3000/webhooks/stripe \
-  -H "Content-Type: application/json" \
-  -H "Idempotency-Key: evt_abc123" \
-  -d '{"event":"payment.succeeded","amount":500}'
+npm run gateway -- sources set payments https://receiver.example/hook WG_SOURCE_PAYMENTS_SECRET
+npm run gateway -- sources list
+npm run gateway -- sources disable payments
 ```
 
-## Idempotency
+`set` creates or updates a route and enables it. It checks that the referenced secret exists locally before writing. Commands print the variable name, never its value. To rotate a source secret, update its environment value and restart all gateway processes; old signatures stop working immediately. There is no overlap/key-ring period.
 
-Webhook providers redeliver. A provider that doesn't receive a timely `2xx` will send the same event again, so an ingest endpoint must be able to receive the same event twice without recording it twice.
+### Mandatory custom HMAC signing
 
-A unique index on `(source, idempotency_key)` makes the database itself the source of truth: a replayed event violates that index, Postgres raises error `23505`, and the endpoint answers `200 duplicate` instead of failing. Duplicate delivery is normal traffic, not an error — answering `2xx` is what tells the provider to stop retrying.
+Every ingest request must be signed. There is no unsigned development mode and no fallback to `DESTINATION_URL` or `WEBHOOK_SIGNING_SECRET`.
 
-Events sent without an `Idempotency-Key` are always stored (the column is nullable and the unique index ignores nulls).
+```
+X-Webhook-Signature: t=<unix-seconds>,v1=<64-character hex HMAC-SHA256>
+```
 
-### Delivery destination
+Sign the exact UTF-8 body as `${timestamp}.${rawBody}` with the source secret. Timestamps more than five minutes from the server clock are rejected. Duplicate signature fields, invalid timestamps, malformed hashes, body tampering and wrong-source secrets are rejected. Comparisons are constant-time. Signed requests can still be replayed within five minutes; supply an idempotency key to deduplicate them.
 
-Every stored event carries a `destination_url`, but for now it's the same value for every source: whatever `DESTINATION_URL` is set to in the environment. **Known limitation:** in a real gateway, each source (or each subscriber) would configure its own destination; this project deliberately hardcodes one global destination for now to keep Phase 3 focused on the retry mechanics rather than multi-tenant config. Revisit this before Phase 5 (dashboard), which will need per-source destinations.
+This is a **custom protocol**, not a native GitHub or Stripe adapter. GitHub's `X-Hub-Signature-256` and Stripe's `Stripe-Signature` are not accepted directly. Provider-specific adapters are future work; a label named `stripe` does not make this Stripe-compatible.
 
-## Delivery worker (Phase 3)
+Authentication headers (`X-Webhook-Signature`, `Authorization`, `Cookie`) are excluded from stored event headers. Payloads and other headers may still contain sensitive data; set retention and access rules accordingly.
 
-A standalone process, separate from the HTTP server, that delivers stored events to their `destination_url` and retries failures with exponential backoff.
+### Dashboard credentials and revocable sessions
+
+Passwords were already bcrypt-hashed before Phase A. Previously, setup also saved a generated plaintext password as a comment in `.env.local`. Setup now reads an operator-chosen password through stdin, saves only a cost-12 bcrypt hash and a random session signing secret, and removes the old plaintext comment. Save the password in your password manager.
+
+A successful login creates a durable `dashboard_sessions` row and a 12-hour JWT with a random `jti` and password-hash fingerprint. Every protected request checks both JWT validity and the database session. Logout revokes the server-side session, so a copied cookie no longer works. The CLI can revoke all sessions. Password-hash or session-secret changes invalidate existing tokens. Legacy tokens without session IDs are rejected. Database failures fail closed and issue no login cookie.
 
 ```bash
-npm run worker
+# Bash: hidden prompt; no password in command arguments or shell history.
+read -r -s -p 'Dashboard password (16-72 UTF-8 bytes): ' WG_PASSWORD; printf '\n'
+printf '%s' "$WG_PASSWORD" | npm run setup:auth
+unset WG_PASSWORD
+
+# Password replacement invalidates existing cookies:
+# Repeat the hidden prompt, then pipe into npm run setup:auth -- --force
+npm run gateway -- sessions-revoke-all
 ```
 
-It polls every ~2 seconds. Each cycle:
+Only one operator account is supported. No email reset flow, user registration, MFA, or distributed login rate limiting is provided. Do not confuse a revocable single-operator dashboard with a hosted identity service. Cookies are httpOnly, SameSite=Lax, path `/`, and Secure when `NODE_ENV=production`. Serve production behind HTTPS and protect login with rate limiting at your reverse proxy before public deployment.
 
-1. Calls the `claim_pending_webhook_events` RPC (a `SECURITY DEFINER` Postgres function, added via migration, granted to the `anon` role), which atomically claims every due event (`status = 'pending'` and `next_attempt_at <= now`) and flips it to `in_progress` in one transaction. That atomicity is what makes it safe to eventually run more than one worker instance without two workers claiming — and delivering — the same event twice.
-2. For each claimed event, sends an HTTP POST to its `destination_url` with the stored `payload` as the body.
-3. A `2xx` response calls `mark_webhook_event_delivered` and the event is done.
-4. Anything else — non-2xx, timeout, network error, or a missing `destination_url` — calls `mark_webhook_event_retry` with a computed backoff delay. After 5 total attempts, that same RPC marks the event `dead_lettered` instead of scheduling another retry (Phase 4 will build a way to inspect and replay dead-lettered events).
+## Database access and migration
 
-Every attempt is logged to the console with the event id, attempt number, and outcome.
+Phase A uses `SUPABASE_SERVICE_ROLE_KEY` **server-side only**. Never put it in frontend code, logs, a public environment file, or chat. The previous anon-key RPC design was not a safe auth boundary: SECURITY DEFINER read/replay RPCs granted to anon could be called directly, bypassing dashboard cookies. `migrations/008_phase_a.sql` revokes PUBLIC/anon/authenticated access to the gateway tables and old/new RPCs, and grants access to service_role. New RPCs pin an empty search path and fully qualify tables.
 
-The claim/deliver/mark loop lives in `src/deliveryWorker.ts` as `processPendingBatch()`, kept separate from the `setInterval` wrapper in `src/worker.ts` so it can be tested by calling it directly, without waiting on real timers.
+This is an upgrade migration. **The Phase 2-5 base schema and RPC migrations were applied out-of-band and are not in this repository.** Apply it only to an existing gateway database containing `webhook_events`, `circuit_breakers`, and the worker/DLQ/dashboard RPCs named in the SQL. A fresh database cannot be bootstrapped from this repository alone. The migration does not rewrite existing event destinations or register old source labels automatically.
 
-### Backoff formula
+Migration order, during a maintenance window:
 
-`src/backoff.ts` implements **exponential backoff with full jitter**: instead of always waiting exactly `baseDelay * 2^attempt`, it waits a *random* amount of time between 0 and that value. In plain terms — after your Nth failure, don't just wait longer each time (that's plain exponential backoff); wait a *random* amount up to that longer ceiling. This staggers retries so that if many events fail at once (e.g. the destination goes down entirely), they don't all come back and retry at the exact same instant and immediately overwhelm it again the moment it recovers.
+1. Back up the database and stop old gateway/worker processes.
+2. Review and apply `migrations/008_phase_a.sql` as the database owner in Supabase's SQL editor. It is transactional and repeatable.
+3. Set the server-only service-role key and per-source secrets, deploy this code, configure dashboard credentials, and register each source before reopening traffic.
+4. Confirm anon/authenticated keys cannot insert events, list events, claim/replay events, or read sources/sessions; confirm signed ingest, delivery, login and copied-cookie logout revocation with a disposable source.
 
-```
-delay = random(0, min(maxDelay, baseDelay * 2^attempt))
-```
-
-With `baseDelay = 1000ms` and `maxDelay = 5 minutes`: the first retry waits up to 1s, the second up to 2s, the third up to 4s, and so on, capping at 5 minutes once the exponent gets large. After 5 attempts total, the event is dead-lettered rather than retried again.
-
-## Circuit breaker (Phase 4)
-
-Backoff alone doesn't stop the worker from hammering a destination that's entirely down: each event still retries on its own schedule, and with enough concurrent events that adds up to steady traffic against a dead service. A circuit breaker tracks failures *per destination* (not per event) and, once a destination looks reliably down, stops sending it traffic for a cooldown period — giving it room to recover instead of getting retried into the ground.
-
-State lives in a `circuit_breakers` table (one row per `destination_url`), managed entirely through `SECURITY DEFINER` RPCs — nothing touches the table directly. There's no stored "half-open" state; it's derived: once a breaker is `open` and its cooldown (`next_probe_at`) has passed, the next event claimed for that destination is treated as a probe attempt instead of being skipped.
-
-Before attempting delivery, the worker checks `get_circuit_breaker_state(destination_url)`:
-
-- **`closed`** — deliver normally.
-- **`open`, cooldown not yet elapsed** — don't attempt delivery. Call `mark_webhook_event_skipped`, which puts the event back to `pending` with a new `next_attempt_at` *without* incrementing its `attempts` count — being skipped isn't a failed delivery attempt, so it shouldn't count against the event's own retry budget.
-- **`open`, cooldown elapsed** — attempt delivery anyway, as a probe.
-
-After every real delivery attempt (including probes): success calls `record_delivery_success` (resets the breaker to `closed`); failure calls `record_delivery_failure`, which increments a failure counter and flips the breaker to `open` (with a fresh cooldown) once it crosses the threshold. Defaults, applied by the RPCs themselves: **5 consecutive failures** trips the breaker, **60 second** cooldown.
-
-Because the failure counter is per-destination, not per-event, a handful of different events all failing against the same flaky destination trips the breaker exactly like one event failing repeatedly would.
-
-## Dead-letter queue (Phase 4)
-
-Events that exhaust their 5 delivery attempts land in `status = 'dead_lettered'` and stop being retried automatically. The CLI inspects and replays them:
-
-```bash
-npm run gateway -- dlq list
-npm run gateway -- dlq replay <event-id>
-```
-
-The older standalone form still works and does exactly the same thing — it is kept as an alias so nothing written against it breaks:
-
-```bash
-npm run dlq -- list
-npm run dlq -- replay <event-id>
-```
-
-`list` prints every dead-lettered event's id, source, attempts, and last-updated time. `replay <id>` resets a dead-lettered event back to `pending` with `attempts = 0`, so the worker picks it up again on its next poll.
-
-**Implementation note:** `replay_webhook_event` returns no signal either way — calling it on a real dead-lettered row and on a nonexistent id both come back as `{ data: null, error: null }` (confirmed empirically against the live RPC before writing the CLI). So `replay` checks `list_dead_lettered_events` itself first to decide whether to report success or a clear "not dead-lettered (not found, or already replayed)" message, rather than trusting the RPC's return value.
-
-## Dashboard (Phase 5)
-
-A small web dashboard for watching events and replaying dead-lettered ones by hand, served by the same Express process as the ingest endpoint.
-
-### Logging in
-
-Credentials are generated once, locally:
-
-```bash
-npm run setup:auth
-```
-
-That writes three things into `.env.local` (which is gitignored and never committed):
-
-- `ADMIN_PASSWORD_HASH` — a bcrypt hash of a freshly generated random password.
-- `SESSION_SECRET` — a random value used to sign session tokens.
-- A comment line holding the **plaintext password**.
-
-The plaintext password exists in that one file and nowhere else. It is never printed to the console, never written to the README, never committed, and cannot be recovered from the hash. Open `.env.local`, copy the password somewhere safe, and delete the comment line if you'd rather it not sit there.
-
-Re-running `npm run setup:auth` refuses to overwrite an existing configuration. Use `npm run setup:auth -- --force` to deliberately generate a new password — which invalidates the old one and signs everyone out.
-
-Then start the server and visit <http://localhost:3000>:
-
-```bash
-npm run dev
-```
-
-`/` redirects to `/login.html` or `/dashboard.html` depending on whether you already have a valid session.
-
-### Pages
-
-- **`/login.html`** — password form; posts to `/api/login` and redirects to the dashboard on success.
-- **`/dashboard.html`** — a status filter, a table of the 100 most recent events (id, source, status, attempts, received), a circuit breakers table (destination, state, consecutive failures, next probe), and a **Replay** button on dead-lettered rows. Any fetch that comes back `401` bounces the browser to the login page.
-
-Plain HTML and vanilla JavaScript, no build step and no framework — the dashboard is a thin view over the API.
-
-### API routes
-
-| Route | Auth | Purpose |
-|---|---|---|
-| `POST /api/login` | public | `{ "password": "..." }` → sets an httpOnly session cookie. Wrong, missing, or malformed password all get the same `401 {"error":"Invalid credentials"}`. |
-| `POST /api/logout` | public | Clears the session cookie. Works without a valid session — logging out of an expired session isn't an error. |
-| `GET /api/events?status=` | session | Calls `list_webhook_events`. `status` is optional; an unrecognised value gets a `400` rather than a silently empty list. Capped at 100 rows. |
-| `GET /api/circuit-breakers` | session | Calls `list_circuit_breakers`. |
-| `POST /api/events/:id/replay` | session | Calls `replay_webhook_event`. Returns `409` with a clear message if the event isn't dead-lettered. |
-
-Both read routes go through `SECURITY DEFINER` RPCs (migration `add_dashboard_read_functions`) for the same reason every other database call in this project does: the `anon` key still has no direct read rights on `webhook_events`.
-
-`GET /api/events` deliberately does **not** return each event's `payload` or `headers`. The RPC returns full rows, but a single payload can be ~100 KB, so 100 of them would be a multi-megabyte response for a table that renders five columns of metadata.
-
-`POST /api/events/:id/replay` checks the dead-lettered list itself before calling the RPC, for the same reason the DLQ CLI does — `replay_webhook_event` returns `{ data: null, error: null }` whether it replayed a row or matched nothing, so trusting its return value would report success for every id, including ids that don't exist.
-
-### Why not Supabase Auth here
-
-This is a deliberately simple, self-rolled session scheme: a bcrypt-hashed password in `.env.local`, and a JWT signed with a local secret, handed to the browser as an httpOnly cookie with a 12-hour expiry. The reason it's sufficient is that **the browser never talks to Supabase**. In a typical Supabase app the frontend holds the anon key and calls the database directly, so Supabase's own auth has to be the gate — it's the only thing in the request path. Here the Express server is the only thing that ever holds that key; the browser only ever talks to this server's API. That makes a server-side session cookie a real gate rather than a decorative one, and it avoids wiring up Supabase Auth's email-confirmation flow for what is a single-operator admin page. The trade-offs are accepted and worth naming: one shared password rather than per-user accounts, no password reset flow, and no way to revoke an issued token before it expires — which is why the expiry is short.
-
-## CLI and public tunnel (Phase 6)
-
-Up to Phase 5 the gateway only ever listened on `localhost`, which meant no real webhook sender could reach it — you could test it against yourself, but never against Stripe. Phase 6 fixes that with one command:
-
-```bash
-npm run gateway -- start
-```
-
-That starts the ingest server, starts the delivery worker, opens a public tunnel to the local port, and prints where to point a sender:
-
-```
-Your gateway is live at: https://quiet-jars-push.loca.lt
-Point Stripe (or any webhook sender) at https://quiet-jars-push.loca.lt/webhooks/<source>
-  e.g. https://quiet-jars-push.loca.lt/webhooks/stripe
-
-Dashboard: http://localhost:3000/dashboard.html
-  Admin password lives in .env.local (written by `npm run setup:auth`).
-
-Delivery worker is running in this same process. Press Ctrl+C to stop both.
-```
-
-The URL changes every run — quick tunnels are ephemeral by design.
-
-### Commands
-
-```bash
-npm run gateway -- --help                     # all subcommands
-npm run gateway -- start                      # server + worker + public tunnel
-npm run gateway -- start --port 4100          # bind a different port (tunnel follows it)
-npm run gateway -- start --no-tunnel          # local only, no public URL
-npm run gateway -- start --poll-interval 500  # faster worker polling
-npm run gateway -- dlq list
-npm run gateway -- dlq replay <event-id>
-```
-
-### One process, not three
-
-`start` runs the server and the worker **in the same process**, and `Ctrl+C` stops both. That is a deliberate choice rather than spawning child processes: `npm run` and `npx` each spawn a child that actually holds the port, and killing the wrapper leaves that child alive. This project lost most of a phase to exactly that — an orphaned server on port 3000 serving stale code and returning confusing 404s. A single process has no parent/child gap to leak through.
-
-Shutdown closes things in reverse order of exposure — tunnel first (so no new external traffic arrives), then the HTTP server, then the worker, which is awaited so an in-flight delivery finishes recording its outcome instead of being cut off between "request sent" and "result written". Each step runs even if an earlier one throws, so one stubborn resource can't leave the port bound.
-
-### Which tunnel, and why
-
-**localtunnel**, because `cloudflared` is not installed on this machine.
-
-A Cloudflare quick tunnel (`cloudflared tunnel --url http://localhost:3000`) would be the better option — no account needed, no interstitial page, and more reliable. But installing `cloudflared` requires a system package manager and root, which is out of scope here. localtunnel is a plain npm dependency with a programmatic Node API and no signup, so it works with what is actually available. Swapping back later means changing `src/tunnel.ts` only — everything else talks to the `openTunnel(port) → { url, close() }` interface.
-
-**The caveat that comes with localtunnel:** `loca.lt` sometimes shows a one-time "click to continue" interstitial HTML page to an IP address the first time it sees it. A human in a browser clicks through it once; an automated sender like Stripe, hitting the URL directly, can receive that HTML page instead of reaching the gateway — which looks like the gateway silently ignoring webhooks.
-
-Two ways around it:
-
-- Send the header `bypass-tunnel-reminder: 1` (any value works). Good for `curl` and for any sender whose headers you control.
-- Visit the URL once in a browser from the same IP and click through. Good for senders whose headers you don't control — which includes Stripe.
-
-If a tunnel fails to open, `start` says so and keeps serving locally rather than exiting. Losing external reachability shouldn't take down a gateway that otherwise works.
-
-### Pointing a real Stripe webhook at this
-
-1. Run `npm run gateway -- start` and copy the printed public URL.
-2. Open the URL in a browser once and click through the loca.lt interstitial if it appears. Do this **before** step 3 — otherwise Stripe's endpoint-verification request may hit the interstitial and the endpoint won't validate.
-3. In the Stripe Dashboard, go to **Developers → Webhooks → Add endpoint** and set the endpoint URL to `https://<your-url>.loca.lt/webhooks/stripe`.
-4. Select the events to send, save, and use **Send test webhook** to fire one.
-5. Watch it arrive at `http://localhost:3000/dashboard.html`, or check the terminal — the worker logs each delivery attempt.
-
-Set `DESTINATION_URL` in `.env.local` first, or events will be stored and then fail delivery with "no destination_url set". The URL is ephemeral, so a tunnel restart means updating the endpoint in Stripe again.
-
-Signature verification is **not** implemented — this accepts any POST to `/webhooks/:source`. That is fine for development against a URL nobody else knows, and is Phase 7 work before anything like this faces the real internet for long.
-
-### Dependency note
-
-`localtunnel@2.0.2` pulls in an old `axios` with open high-severity advisories (`npm audit`). It is a development-only convenience that never runs in production, so it is accepted here rather than pinned around — but it is a real reason not to promote this dependency into a production path.
-
-## Signature verification (Phase 7)
-
-Until Phase 7, `/webhooks/:source` accepted any POST from anyone who learned the URL. Set `WEBHOOK_SIGNING_SECRET` and it will only accept requests carrying a valid HMAC signature.
-
-Senders supply a header in the format Stripe and GitHub use:
-
-```
-X-Webhook-Signature: t=1800000000,v1=<hex sha256 hmac>
-```
-
-where the HMAC is computed over the string `` `${t}.${rawBody}` `` using the shared secret.
-
-Three details in that scheme each defend against a specific attack, and they're worth being able to explain:
-
-- **The timestamp is signed together with the body.** Signing the body alone would make a captured request replayable forever, because its signature never expires. Binding a timestamp in means a capture goes stale — requests more than 5 minutes off the server clock (in either direction, which also covers a badly skewed sender) are rejected.
-- **The signature is computed over the raw bytes as received**, not over a re-serialised object. `JSON.stringify(JSON.parse(body))` can reorder keys or change whitespace, producing a different HMAC and rejecting perfectly valid requests. The raw body is captured in `express.json()`'s `verify` hook for exactly this reason.
-- **Comparison is constant-time** (`crypto.timingSafeEqual`). A plain `===` returns on the first differing byte, so an attacker can measure response times to discover a valid signature one byte at a time.
-
-The rejection reason (`missing signature header`, `signature mismatch`, `signature timestamp outside tolerance`) is written to the server log but never returned to the caller — telling someone *why* their signature failed helps them iterate toward a forgery. Clients always get the same `401 Invalid signature`.
-
-**When `WEBHOOK_SIGNING_SECRET` is unset, verification is disabled** and unsigned requests are accepted. That's convenient locally and dangerous anywhere else, so the server logs a warning on every startup in that state.
-
-## Security notes
-
-The `webhook_events` table has Row Level Security enabled with a policy permitting `INSERT` only for the `anon` role — no select, update, or delete. The ingest endpoint runs server-side but deliberately uses that low-privilege key, so a leaked key cannot be used to read or tamper with stored events.
-
-One consequence worth knowing: because the key has no read rights, the endpoint cannot ask Postgres to return the row it just inserted (`INSERT ... RETURNING` requires SELECT rights and fails with `42501`). The event `id` is therefore generated in the application and included in the insert, which keeps the response contract intact without loosening the policy.
+Old code using the anon key will fail after the migration. Reverting only the application is not a rollback. Do not restore anonymous RPC access on an internet-facing gateway; coordinate schema and application rollback together.
 
 ## Configuration
 
-Copy the required values into `.env.local` (gitignored, never committed):
+Create `.env.local` (gitignored). Do not commit real values. Protect this file and secret backups.
 
+```dotenv
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=your-server-only-key
+WG_SOURCE_PAYMENTS_SECRET=your-high-entropy-source-secret
+# Generated by setup:auth:
+# ADMIN_PASSWORD_HASH='...'
+# SESSION_SECRET='...'
+# Set NODE_ENV=production only when served over HTTPS.
 ```
-SUPABASE_URL=...
-SUPABASE_ANON_KEY=...
-DESTINATION_URL=...
-WEBHOOK_SIGNING_SECRET=...   # optional; when set, incoming webhooks must be signed
-```
 
-`ADMIN_PASSWORD_HASH` and `SESSION_SECRET` are added by `npm run setup:auth` — don't write those by hand.
+Signing secret example generation: `openssl rand -hex 32`. Keep the generated value private and share it only through your sender's secure configuration path. Source secrets, the service-role key and session secret require secure collection, never chat.
 
-## Running it
+## Running and tests
+
+Node 22 or newer is recommended (locked dependencies include Commander 15).
 
 ```bash
-npm install
-npm run setup:auth  # one-time: generates the dashboard password into .env.local
-
-npm run gateway -- start     # the usual way in: server + worker + public tunnel, Ctrl+C stops all
-npm run gateway -- --help    # all subcommands
-
-npm test        # runs the test suite
+npm ci
+npm run build
+npm test
+npm run gateway -- --help
+npm run gateway -- start --no-tunnel
 ```
 
-Individual pieces, still available for running them apart (a second machine, a separate container, or just quieter output):
+`gateway start` runs server and worker in one process. Options: `--port <port>`, `--poll-interval <ms>`, `--no-tunnel`. Ctrl+C/SIGTERM shuts down the tunnel, server, then worker. `npm run dev` and `npm run worker` remain available separately. Avoid mixing old/new workers during migration.
+
+Localtunnel is a development convenience: its URL is ephemeral, may show an interstitial, and is not a stable production endpoint. `start` opens a tunnel unless `--no-tunnel` is passed. Using a tunnel does not make the custom signatures compatible with a provider. No new paid service is required for Phase A.
 
 ```bash
-npm run dev     # ingest HTTP server + dashboard only (http://localhost:3000), no tunnel
-npm run worker  # delivery worker only, as its own process
+npm run gateway -- dlq list
+npm run gateway -- dlq replay <event-id>
 ```
+
+Tests use fake Supabase RPC storage and real local HTTP receivers. They cover routing, source isolation, signing, idempotency, retries, DLQ/replay, breakers, session creation/revocation and failure handling. Passing these tests is not a live Supabase migration or deployment check.
+
+## HTTP endpoints
+
+- `GET /health`: public, `200 {"status":"ok"}`. Liveness only, not a database readiness check.
+- `POST /webhooks/:source`: non-empty JSON body, 1 MB cap; source is 1-64 letters/digits/underscore/hyphen. `202` stored, `200` duplicate, `400` invalid input, `401` invalid signature, `404` unknown/disabled source, `413` oversized body, `503` unusable source configuration, `500` storage/server failure.
+- `POST /api/login`: `{ "password": "..." }`; creates cookie after credential and durable-session storage success.
+- `POST /api/logout`: revokes this session and clears cookie. Still works with no/invalid cookie; reports failure if revocation storage is unavailable.
+- `GET /api/events?status=...`: authenticated event table, latest 100; valid filters `pending`, `in_progress`, `delivered`, `failed`, `dead_lettered`. Payloads/headers excluded from dashboard response.
+- `GET /api/circuit-breakers`: authenticated breaker list.
+- `POST /api/events/:id/replay`: authenticated replay of a dead-lettered event; `409` if not found/not dead-lettered.
+- `/login.html`, `/dashboard.html`: public static shells; data/replay are gated server-side.
+
+## Remaining work before a public service
+
+- Recover and version the original database schema/RPC migrations; verify this upgrade against the actual Supabase project, especially role privileges.
+- Add abandoned-claim recovery/leases, stable event IDs in downstream delivery and downstream idempotency. Investigate overlapping poll/probe concurrency before scaling workers.
+- Add provider-native signature adapters and outbound signing, destination controls appropriate for any multi-tenant use, stronger identity/rate limiting, retention, metrics and stable HTTPS hosting.
+- Keep secrets separate from browser assets and logs. Service-role access has broad privileges; scope operational access to this dedicated gateway database.
 
 ## Phases
 
 0. Recon
 1. Skeleton
-2. Ingest endpoint
-3. Delivery worker (backoff + jitter)
-4. Dead-letter queue + circuit breaker
-5. Dashboard (auth + replay)
-6. CLI (localhost tunnel) (current)
-7. Production polish
+2. Ingest
+3. Delivery worker
+4. DLQ + circuit breaker
+5. Dashboard
+6. CLI + development tunnel (complete)
+7. Production polish (Phase A in this branch; live migration/deployment pending)
+
+### Dependency audit at Phase A review
+
+`npm audit --omit=dev` reported five pre-existing runtime vulnerabilities (three moderate, two high), involving localtunnel's axios and `qs` through Express/body-parser. No forced downgrade was applied. Treat localtunnel as development-only; resolve the dependency audit before public deployment. Phase A adds no runtime dependencies.

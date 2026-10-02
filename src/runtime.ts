@@ -28,16 +28,6 @@ export interface WorkerHandle {
 // Resolves only once the port is actually bound, and rejects on EADDRINUSE
 // rather than leaving a half-started gateway whose tunnel points at nothing.
 export function startServer(port: number): Promise<ServerHandle> {
-  // Warned about here rather than inside app.ts, which must stay free of
-  // import-time side effects so tests can import it cheaply.
-  if (!process.env.WEBHOOK_SIGNING_SECRET) {
-    console.warn(
-      "[server] WEBHOOK_SIGNING_SECRET is not set — /webhooks/:source will accept " +
-        "UNSIGNED requests from anyone who knows the URL. Fine locally; set it before " +
-        "exposing this to the internet."
-    );
-  }
-
   return new Promise((resolve, reject) => {
     const server: Server = app.listen(port);
 

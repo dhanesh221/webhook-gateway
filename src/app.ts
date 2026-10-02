@@ -6,6 +6,9 @@ import { getSupabase } from "./supabase";
 import { dashboardRouter } from "./dashboard";
 import { hasValidSession } from "./auth";
 import { verifySignature, SIGNATURE_HEADER } from "./signature";
+import { getSource, sourceSecret, SOURCE_PATTERN, validateDestination } from "./sources";
+import { asyncRoute } from "./asyncRoute";
+export { SOURCE_PATTERN } from "./sources";
 
 // Chosen deliberately rather than inherited. express.json() defaults to 100 KB,
 // which this project relied on by accident until it was measured; real providers
@@ -16,7 +19,7 @@ export const MAX_BODY_BYTES = 1024 * 1024;
 // `source` is a label, not free text. It becomes half of the idempotency identity
 // and appears in dashboard URLs, so it is constrained to characters that are
 // unambiguous in both roles. Unvalidated, it accepted values like `../../etc`.
-export const SOURCE_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+
 
 // Requests carry their raw bytes through for signature verification. The signature
 // is computed over exactly what was sent — re-serialising the parsed object can
@@ -44,7 +47,7 @@ app.get("/health", (_req, res) => {
 
 // Receives a webhook from an external provider and stores it for later delivery.
 // Responds immediately — actual delivery is the Phase 3 worker's job.
-app.post("/webhooks/:source", async (req, res) => {
+app.post("/webhooks/:source", asyncRoute(async (req, res) => {
   const source = req.params.source;
   const idempotencyKey = req.header("Idempotency-Key") || null;
   const payload = req.body;
@@ -55,40 +58,35 @@ app.post("/webhooks/:source", async (req, res) => {
     });
   }
 
-  // Verification is enabled by the presence of a secret. When none is set the
-  // endpoint accepts unsigned requests, which is convenient for local testing and
-  // dangerous anywhere else — startServer() logs a warning in that case.
-  const signingSecret = process.env.WEBHOOK_SIGNING_SECRET;
-  if (signingSecret) {
-    const result = verifySignature({
-      secret: signingSecret,
-      header: req.header(SIGNATURE_HEADER),
-      rawBody: (req as RawBodyRequest).rawBody ?? "",
-    });
-
-    if (!result.ok) {
-      // The reason is logged but never returned: telling a caller *why* their
-      // signature failed helps them iterate toward a forgery.
-      console.warn(`[ingest] rejected ${source}: ${result.reason}`);
-      return res.status(401).json({ error: "Invalid signature" });
-    }
+  const route = await getSource(source);
+  if (!route || !route.enabled) return res.status(404).json({ error: "Source unavailable" });
+  // Configuration failures are 503, not an unsigned fallback. Never disclose
+  // the environment variable name or secret to the caller.
+  let signingSecret: string;
+  let destinationUrl: string;
+  try {
+    signingSecret = sourceSecret(route);
+    destinationUrl = validateDestination(route.destination_url);
+  } catch {
+    return res.status(503).json({ error: "Source unavailable" });
+  }
+  const result = verifySignature({
+    secret: signingSecret, header: req.header(SIGNATURE_HEADER),
+    rawBody: (req as RawBodyRequest).rawBody ?? "",
+  });
+  if (!result.ok) {
+    console.warn(`[ingest] rejected ${source}: ${result.reason}`);
+    return res.status(401).json({ error: "Invalid signature" });
   }
 
-  if (!payload || typeof payload !== "object" || Object.keys(payload).length === 0) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload) || Object.keys(payload).length === 0) {
     return res
       .status(400)
       .json({ error: "Request body must be a non-empty JSON object" });
   }
 
-  // The id is generated here rather than read back from the database. The table's
-  // RLS policy grants INSERT only, and asking Postgres to RETURN the new row needs
-  // SELECT rights — so `.select()` after an insert fails with 42501. Generating the
-  // uuid client-side lets us report it while keeping the anon key read-blocked.
+  // Generate the event ID before storage so the same ID is returned to the sender.
   const id = randomUUID();
-
-  // Read at request time (not module load) so importing app.ts never requires
-  // env vars — same reasoning as getSupabase()'s lazy init.
-  const destinationUrl = process.env.DESTINATION_URL || null;
 
   const { error } = await getSupabase()
     .from("webhook_events")
@@ -96,7 +94,9 @@ app.post("/webhooks/:source", async (req, res) => {
       id,
       source,
       idempotency_key: idempotencyKey,
-      headers: req.headers,
+      // Authentication material must not be retained in event history.
+      headers: Object.fromEntries(Object.entries(req.headers).filter(([key]) =>
+        ![SIGNATURE_HEADER, "authorization", "cookie"].includes(key))),
       payload,
       status: "pending",
       destination_url: destinationUrl,
@@ -117,7 +117,7 @@ app.post("/webhooks/:source", async (req, res) => {
   }
 
   return res.status(202).json({ id, status: "pending" });
-});
+}));
 
 // Phase 5 dashboard. Mounted after the ingest routes so nothing here can shadow
 // them, and before express.static so that a stray public/api/... file could
@@ -130,9 +130,9 @@ app.use("/api", dashboardRouter);
 // Resolves to <project>/public from both src/ (tsx) and dist/ (compiled).
 app.use(express.static(path.join(__dirname, "..", "public")));
 
-app.get("/", (req, res) => {
-  res.redirect(hasValidSession(req) ? "/dashboard.html" : "/login.html");
-});
+app.get("/", asyncRoute(async (req, res) => {
+  res.redirect(await hasValidSession(req) ? "/dashboard.html" : "/login.html");
+}));
 
 // Catch-all error handler. Every error ends up here — nothing falls through to
 // Express's default HTML handler, which would leak a stack trace (and absolute

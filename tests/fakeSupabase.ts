@@ -47,6 +47,8 @@ export function makeFakeSupabase(
   const table = new Map<string, FakeRow>(
     rows.map((r) => [r.id, { ...r, status: "pending" }])
   );
+  const sources = new Map<string, {name: string; destination_url: string; secret_env: string; enabled: boolean}>();
+  const sessions = new Map<string, {expires: number; revoked: boolean}>();
   const breakers = new Map<string, FakeBreaker>();
 
   function breakerFor(url: string): FakeBreaker {
@@ -101,6 +103,32 @@ export function makeFakeSupabase(
 
     rpc: async (fn: string, args?: Record<string, unknown>) => {
       switch (fn) {
+        case "get_webhook_source": return { data: [sources.get(args!.p_name as string)].filter(Boolean), error: null };
+        case "list_webhook_sources": return { data: [...sources.values()], error: null };
+        case "upsert_webhook_source": {
+          sources.set(args!.p_name as string, {name: args!.p_name as string, destination_url: args!.p_destination_url as string, secret_env: args!.p_secret_env as string, enabled: true});
+          return { data: null, error: null };
+        }
+        case "disable_webhook_source": {
+          const row = sources.get(args!.p_name as string); if (row) row.enabled = false;
+          return { data: !!row, error: null };
+        }
+        case "create_dashboard_session": {
+          sessions.set(args!.p_id as string, {expires: Date.parse(args!.p_expires_at as string), revoked: false});
+          return { data: null, error: null };
+        }
+        case "is_dashboard_session_active": {
+          const session = sessions.get(args!.p_id as string);
+          return { data: !!session && !session.revoked && session.expires > Date.now(), error: null };
+        }
+        case "revoke_dashboard_session": {
+          const session = sessions.get(args!.p_id as string); if (session) session.revoked = true;
+          return { data: null, error: null };
+        }
+        case "revoke_all_dashboard_sessions": {
+          for (const session of sessions.values()) session.revoked = true;
+          return { data: null, error: null };
+        }
         case "claim_pending_webhook_events": {
           const claimed: ClaimedWebhookEvent[] = [];
           for (const row of table.values()) {
@@ -214,5 +242,5 @@ export function makeFakeSupabase(
     },
   };
 
-  return { client: client as unknown as SupabaseClient, table, breakers };
+  return { client: client as unknown as SupabaseClient, table, breakers, sources, sessions };
 }

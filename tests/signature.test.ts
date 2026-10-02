@@ -117,3 +117,16 @@ describe("verifySignature", () => {
     expect(verify(`t=${NOW},v1=`).ok).toBe(false);
   });
 });
+
+describe("strict signature format", () => {
+  it("rejects duplicate signature or timestamp fields", () => {
+    const header = buildSignatureHeader(SECRET, NOW, BODY);
+    expect(verify(`${header},t=${NOW}`).ok).toBe(false);
+    expect(verify(`${header},v1=${signPayload(SECRET,NOW,BODY)}`).ok).toBe(false);
+  });
+  it("rejects fractional and exponent-form timestamps even if signed", () => {
+    for (const text of ["1800000000.5", "1.8e9"]) {
+      expect(verify(`t=${text},v1=${signPayload(SECRET,Number(text),BODY)}`).ok).toBe(false);
+    }
+  });
+});

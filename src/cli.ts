@@ -11,6 +11,8 @@ import dotenv from "dotenv";
 // startup output that actually matters.
 dotenv.config({ path: ".env.local", quiet: true });
 
+import { saveSource, listSources, disableSource } from "./sources";
+import { revokeAllSessions } from "./auth";
 import { Command, CommanderError } from "commander";
 import {
   startServer,
@@ -29,6 +31,10 @@ export interface CliDeps {
   openTunnel(port: number): Promise<TunnelHandle>;
   dlqList(): Promise<void>;
   dlqReplay(id: string | undefined): Promise<void>;
+  saveSource?: typeof saveSource;
+  listSources?: typeof listSources;
+  disableSource?: typeof disableSource;
+  revokeAllSessions?: typeof revokeAllSessions;
   log(message: string): void;
   error(message: string): void;
   /**
@@ -43,6 +49,7 @@ export const realDeps: CliDeps = {
   startServer,
   startWorker,
   openTunnel,
+  saveSource, listSources, disableSource, revokeAllSessions,
   dlqList: () => dlqList(),
   dlqReplay: (id) => dlqReplay(id),
   log: (message) => console.log(message),
@@ -72,7 +79,7 @@ export function formatStartupBanner(port: number, publicUrl: string | null): str
   if (publicUrl) {
     lines.push(`Your gateway is live at: ${publicUrl}`);
     lines.push(
-      `Point Stripe (or any webhook sender) at ${publicUrl}/webhooks/<source>`
+      `Point a sender using the gateway HMAC protocol at ${publicUrl}/webhooks/<source>`
     );
     lines.push(`  e.g. ${publicUrl}/webhooks/stripe`);
   } else {
@@ -84,7 +91,7 @@ export function formatStartupBanner(port: number, publicUrl: string | null): str
 
   lines.push("");
   lines.push(`Dashboard: http://localhost:${port}/dashboard.html`);
-  lines.push(`  Admin password lives in .env.local (written by \`npm run setup:auth\`).`);
+  lines.push(`  Admin password hash lives in .env.local (set by \`npm run setup:auth\`).`);
   lines.push("");
   lines.push("Delivery worker is running in this same process. Press Ctrl+C to stop both.");
 
@@ -214,6 +221,24 @@ export function buildProgram(deps: CliDeps): Command {
     .action(async (eventId: string) => {
       await deps.dlqReplay(eventId);
     });
+
+  const sources = program.command("sources").description("Manage operator-owned source routes");
+  sources.command("set <name> <destination-url> <secret-env>")
+    .description("Create/update and enable a source; pass the env variable NAME, never the secret")
+    .action(async (name, destination, secretEnv) => {
+      await (deps.saveSource ?? saveSource)(name, destination, secretEnv);
+      deps.log(`Source ${name} saved. Previously queued events retain their destination.`);
+    });
+  sources.command("list").action(async () => {
+    for (const row of await (deps.listSources ?? listSources)())
+      deps.log(`${row.name} ${row.enabled ? "enabled" : "disabled"} ${row.destination_url} ${row.secret_env}`);
+  });
+  sources.command("disable <name>").action(async name => {
+    await (deps.disableSource ?? disableSource)(name);
+    deps.log(`Source ${name} disabled for new ingest; queued events are unchanged.`);
+  });
+  program.command("sessions-revoke-all").description("Revoke every dashboard session")
+    .action(async () => { await (deps.revokeAllSessions ?? revokeAllSessions)(); deps.log("Dashboard sessions revoked."); });
 
   return program;
 }

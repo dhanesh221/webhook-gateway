@@ -4,7 +4,7 @@
 // A signature proves the request came from someone holding the shared secret, and
 // that the body wasn't altered in transit.
 //
-// The scheme is the one Stripe and GitHub use, for a reason worth knowing: the
+// This is a custom protocol, not a native Stripe or GitHub signature adapter: the
 // timestamp is signed *together with* the body. Signing the body alone would let
 // an attacker who captured one valid request replay it verbatim forever, since
 // the signature stays valid indefinitely. Binding a timestamp into the signed
@@ -45,8 +45,8 @@ function parseHeader(header: string): { t?: string; v1?: string } {
     if (index === -1) continue;
     const key = segment.slice(0, index).trim();
     const value = segment.slice(index + 1).trim();
-    if (key === "t") parts.t = value;
-    if (key === "v1") parts.v1 = value;
+    if (key === "t") { if (parts.t !== undefined) return {}; parts.t = value; }
+    if (key === "v1") { if (parts.v1 !== undefined) return {}; parts.v1 = value; }
   }
   return parts;
 }
@@ -85,7 +85,7 @@ export function verifySignature(opts: {
   if (!t || !v1) return { ok: false, reason: "malformed signature header" };
 
   const timestamp = Number(t);
-  if (!Number.isFinite(timestamp)) {
+  if (!/^\d+$/.test(t) || !Number.isSafeInteger(timestamp)) {
     return { ok: false, reason: "malformed signature timestamp" };
   }
 
@@ -96,7 +96,7 @@ export function verifySignature(opts: {
   }
 
   const expected = signPayload(secret, timestamp, rawBody);
-  if (!safeEqualHex(expected, v1)) {
+  if (!/^[0-9a-fA-F]{64}$/.test(v1) || !safeEqualHex(expected, v1)) {
     return { ok: false, reason: "signature mismatch" };
   }
 

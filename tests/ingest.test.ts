@@ -1,16 +1,18 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import request from "supertest";
+import unsignedRequest from "supertest";
+import request, { TEST_SOURCE_SECRET } from "./signedRequest";
 
 // Stand-in for the Supabase call chain: from(...).insert(...)
 // vi.hoisted runs before vi.mock, which vitest lifts above the imports.
 const mocks = vi.hoisted(() => {
   const insert = vi.fn();
   const from = vi.fn(() => ({ insert }));
-  return { insert, from };
+  const rpc = vi.fn(async () => ({ data: [{ name: "stripe", destination_url: "http://localhost:4000/receive", secret_env: "WG_SOURCE_TEST_SECRET", enabled: true }], error: null }));
+  return { insert, from, rpc };
 });
 
 vi.mock("../src/supabase", () => ({
-  getSupabase: () => ({ from: mocks.from }),
+  getSupabase: () => ({ from: mocks.from, rpc: mocks.rpc }),
 }));
 
 import { app, MAX_BODY_BYTES } from "../src/app";
@@ -21,6 +23,7 @@ const UUID_RE =
 
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.stubEnv("WG_SOURCE_TEST_SECRET", TEST_SOURCE_SECRET);
 });
 
 describe("POST /webhooks/:source", () => {
@@ -110,18 +113,12 @@ describe("POST /webhooks/:source", () => {
     expect(res.body.error).toBeTruthy();
   });
 
-  it("stores destination_url from DESTINATION_URL, or null when unset", async () => {
+  it("snapshots destination_url from the registered source, ignoring the global fallback", async () => {
     mocks.insert.mockResolvedValue({ error: null });
-
+    vi.stubEnv("DESTINATION_URL", "https://wrong.example/receive");
     await request(app).post("/webhooks/stripe").send({ a: 1 });
-    let inserted = mocks.insert.mock.calls[0][0] as Record<string, unknown>;
-    expect(inserted.destination_url).toBeNull();
-
-    vi.stubEnv("DESTINATION_URL", "http://localhost:4000/receive");
-    await request(app).post("/webhooks/stripe").send({ a: 1 });
-    inserted = mocks.insert.mock.calls[1][0] as Record<string, unknown>;
+    const inserted = mocks.insert.mock.calls[0][0] as Record<string, unknown>;
     expect(inserted.destination_url).toBe("http://localhost:4000/receive");
-    vi.unstubAllEnvs();
   });
 
   it("returns 400 on an empty body and never touches the database", async () => {
@@ -184,7 +181,7 @@ describe("source validation", () => {
 });
 
 describe("signature verification", () => {
-  const SECRET = "whsec_test_secret";
+  const SECRET = TEST_SOURCE_SECRET;
   const BODY = JSON.stringify({ event: "payment.succeeded", amount: 500 });
 
   beforeEach(() => {
@@ -196,22 +193,22 @@ describe("signature verification", () => {
   });
 
   function post(rawBody: string, header?: string) {
-    const req = request(app)
+    const req = unsignedRequest(app)
       .post("/webhooks/stripe")
       .set("Content-Type", "application/json");
     if (header) req.set(SIGNATURE_HEADER, header);
     return req.send(rawBody);
   }
 
-  it("accepts unsigned requests when no secret is configured", async () => {
+  it("rejects unsigned requests with no global secret configured", async () => {
     const res = await post(BODY);
 
-    expect(res.status).toBe(202);
-    expect(mocks.insert).toHaveBeenCalledTimes(1);
+    expect(res.status).toBe(401);
+    expect(mocks.insert).not.toHaveBeenCalled();
   });
 
   it("accepts a correctly signed request when a secret is configured", async () => {
-    vi.stubEnv("WEBHOOK_SIGNING_SECRET", SECRET);
+    vi.stubEnv("WG_SOURCE_TEST_SECRET", SECRET);
     const now = Math.floor(Date.now() / 1000);
 
     const res = await post(BODY, buildSignatureHeader(SECRET, now, BODY));
@@ -221,7 +218,7 @@ describe("signature verification", () => {
   });
 
   it("rejects an unsigned request once a secret is configured", async () => {
-    vi.stubEnv("WEBHOOK_SIGNING_SECRET", SECRET);
+    vi.stubEnv("WG_SOURCE_TEST_SECRET", SECRET);
 
     const res = await post(BODY);
 
@@ -230,7 +227,7 @@ describe("signature verification", () => {
   });
 
   it("rejects a body tampered with after signing", async () => {
-    vi.stubEnv("WEBHOOK_SIGNING_SECRET", SECRET);
+    vi.stubEnv("WG_SOURCE_TEST_SECRET", SECRET);
     const now = Math.floor(Date.now() / 1000);
     const header = buildSignatureHeader(SECRET, now, BODY);
 
@@ -243,7 +240,7 @@ describe("signature verification", () => {
   });
 
   it("rejects a signature signed with the wrong secret", async () => {
-    vi.stubEnv("WEBHOOK_SIGNING_SECRET", SECRET);
+    vi.stubEnv("WG_SOURCE_TEST_SECRET", SECRET);
     const now = Math.floor(Date.now() / 1000);
 
     const res = await post(BODY, buildSignatureHeader("wrong-secret", now, BODY));
@@ -253,7 +250,7 @@ describe("signature verification", () => {
   });
 
   it("rejects a replayed request whose timestamp is outside tolerance", async () => {
-    vi.stubEnv("WEBHOOK_SIGNING_SECRET", SECRET);
+    vi.stubEnv("WG_SOURCE_TEST_SECRET", SECRET);
     // Correctly signed, but captured an hour ago.
     const old = Math.floor(Date.now() / 1000) - 3600;
 
@@ -264,7 +261,7 @@ describe("signature verification", () => {
   });
 
   it("never tells the caller why the signature failed", async () => {
-    vi.stubEnv("WEBHOOK_SIGNING_SECRET", SECRET);
+    vi.stubEnv("WG_SOURCE_TEST_SECRET", SECRET);
     vi.spyOn(console, "warn").mockImplementation(() => {});
 
     const res = await post(BODY, "t=1,v1=deadbeef");

@@ -6,13 +6,10 @@ import express from "express";
 import cookieParser from "cookie-parser";
 import { SESSION_COOKIE, requireAuth } from "../src/auth";
 
-// Nothing in these tests touches Supabase — but importing app.ts pulls in the
-// dashboard router, which imports supabase.ts. Stub it so no client is built.
-vi.mock("../src/supabase", () => ({
-  getSupabase: () => {
-    throw new Error("getSupabase should not be called in auth tests");
-  },
-}));
+import { makeFakeSupabase } from "./fakeSupabase";
+const holder = vi.hoisted(() => ({ client: null as unknown }));
+vi.mock("../src/supabase", () => ({ getSupabase: () => holder.client }));
+import { issueSessionToken } from "../src/auth";
 
 import { app } from "../src/app";
 
@@ -28,6 +25,7 @@ function cookieHeader(token: string): string {
 }
 
 beforeEach(() => {
+  holder.client = makeFakeSupabase([]).client;
   vi.stubEnv("SESSION_SECRET", TEST_SECRET);
   vi.stubEnv("ADMIN_PASSWORD_HASH", TEST_HASH);
 });
@@ -98,7 +96,7 @@ describe("requireAuth middleware", () => {
   });
 
   it("accepts a validly-signed, unexpired token", async () => {
-    const good = jwt.sign({ sub: "admin" }, TEST_SECRET, { expiresIn: 3600 });
+    const good = await issueSessionToken();
 
     const res = await request(guarded)
       .get("/guarded")
@@ -220,7 +218,7 @@ describe("GET /", () => {
   });
 
   it("sends an authenticated browser to the dashboard", async () => {
-    const good = jwt.sign({ sub: "admin" }, TEST_SECRET, { expiresIn: 3600 });
+    const good = await issueSessionToken();
 
     const res = await request(app).get("/").set("Cookie", cookieHeader(good));
 

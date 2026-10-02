@@ -7,17 +7,17 @@ let client: SupabaseClient | null = null;
 export function getSupabase(): SupabaseClient {
   if (!client) {
     const url = process.env.SUPABASE_URL;
-    const key = process.env.SUPABASE_ANON_KEY;
+    const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
     if (!url || !key) {
       throw new Error(
-        "SUPABASE_URL and SUPABASE_ANON_KEY must be set (see .env.local)"
+        "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set (see .env.local)"
       );
     }
 
-    // The anon key is deliberately low-privilege: the webhook_events RLS policy
-    // allows INSERT only, so a leaked key can't read or tamper with stored events.
-    client = createClient(url, key);
+    // Server-only credential. Phase A migration removes anonymous table/RPC
+    // access so clients cannot bypass mandatory signing or dashboard auth.
+    client = createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } });
   }
 
   return client;

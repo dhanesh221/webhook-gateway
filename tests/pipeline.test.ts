@@ -7,7 +7,7 @@
 // a dead-letter and a tripped breaker happening off the same failures, and a
 // replayed event actually going back out on a later poll.
 import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
-import request from "supertest";
+import request, { TEST_SOURCE_SECRET } from "./signedRequest";
 import bcrypt from "bcryptjs";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
@@ -75,7 +75,9 @@ describe("full pipeline", () => {
     const destinationUrl = await startReceiver(() => 200);
     process.env.DESTINATION_URL = destinationUrl;
 
-    const { client, table } = makeFakeSupabase([]);
+    const { client, table, sources } = makeFakeSupabase([]);
+    vi.stubEnv("WG_SOURCE_TEST_SECRET", TEST_SOURCE_SECRET);
+    for (const name of ["stripe", "github"]) sources.set(name, {name, destination_url: process.env.DESTINATION_URL!, secret_env: "WG_SOURCE_TEST_SECRET", enabled: true});
     mocks.client = client;
 
     const payload = { event: "payment.succeeded", amount: 500 };
@@ -106,7 +108,9 @@ describe("full pipeline", () => {
     const destinationUrl = await startReceiver(() => 200);
     process.env.DESTINATION_URL = destinationUrl;
 
-    const { client, table } = makeFakeSupabase([]);
+    const { client, table, sources } = makeFakeSupabase([]);
+    vi.stubEnv("WG_SOURCE_TEST_SECRET", TEST_SOURCE_SECRET);
+    for (const name of ["stripe", "github"]) sources.set(name, {name, destination_url: process.env.DESTINATION_URL!, secret_env: "WG_SOURCE_TEST_SECRET", enabled: true});
     mocks.client = client;
 
     const payload = { event: "invoice.paid" };
@@ -134,7 +138,9 @@ describe("full pipeline", () => {
     const destinationUrl = await startReceiver(() => 500);
     process.env.DESTINATION_URL = destinationUrl;
 
-    const { client, table, breakers } = makeFakeSupabase([], { cooldownMs: 60_000 });
+    const { client, table, breakers, sources } = makeFakeSupabase([], { cooldownMs: 60_000 });
+    vi.stubEnv("WG_SOURCE_TEST_SECRET", TEST_SOURCE_SECRET);
+    for (const name of ["stripe", "github"]) sources.set(name, {name, destination_url: process.env.DESTINATION_URL!, secret_env: "WG_SOURCE_TEST_SECRET", enabled: true});
     mocks.client = client;
 
     const res = await request(app)
@@ -185,7 +191,9 @@ describe("full pipeline", () => {
     const destinationUrl = await startReceiver(() => (destinationUp ? 200 : 500));
     process.env.DESTINATION_URL = destinationUrl;
 
-    const { client, table } = makeFakeSupabase([], { cooldownMs: COOLDOWN_MS });
+    const { client, table, sources } = makeFakeSupabase([], { cooldownMs: COOLDOWN_MS });
+    vi.stubEnv("WG_SOURCE_TEST_SECRET", TEST_SOURCE_SECRET);
+    for (const name of ["stripe", "github"]) sources.set(name, {name, destination_url: process.env.DESTINATION_URL!, secret_env: "WG_SOURCE_TEST_SECRET", enabled: true});
     mocks.client = client;
 
     const res = await request(app)
@@ -296,7 +304,9 @@ describe("full pipeline through the dashboard API", () => {
     const destinationUrl = await startReceiver(() => (destinationUp ? 200 : 500));
     process.env.DESTINATION_URL = destinationUrl;
 
-    const { client, table } = makeFakeSupabase([], { cooldownMs: COOLDOWN_MS });
+    const { client, table, sources } = makeFakeSupabase([], { cooldownMs: COOLDOWN_MS });
+    vi.stubEnv("WG_SOURCE_TEST_SECRET", TEST_SOURCE_SECRET);
+    for (const name of ["stripe", "github"]) sources.set(name, {name, destination_url: process.env.DESTINATION_URL!, secret_env: "WG_SOURCE_TEST_SECRET", enabled: true});
     mocks.client = client;
 
     const cookie = await login();
@@ -351,7 +361,9 @@ describe("full pipeline through the dashboard API", () => {
     const destinationUrl = await startReceiver(() => 500);
     process.env.DESTINATION_URL = destinationUrl;
 
-    const { client, table } = makeFakeSupabase([], { cooldownMs: 0 });
+    const { client, table, sources } = makeFakeSupabase([], { cooldownMs: 0 });
+    vi.stubEnv("WG_SOURCE_TEST_SECRET", TEST_SOURCE_SECRET);
+    for (const name of ["stripe", "github"]) sources.set(name, {name, destination_url: process.env.DESTINATION_URL!, secret_env: "WG_SOURCE_TEST_SECRET", enabled: true});
     mocks.client = client;
 
     const cookie = await login();
@@ -381,7 +393,9 @@ describe("full pipeline through the dashboard API", () => {
     const destinationUrl = await startReceiver(() => 500);
     process.env.DESTINATION_URL = destinationUrl;
 
-    const { client, table } = makeFakeSupabase([], { cooldownMs: 0 });
+    const { client, table, sources } = makeFakeSupabase([], { cooldownMs: 0 });
+    vi.stubEnv("WG_SOURCE_TEST_SECRET", TEST_SOURCE_SECRET);
+    for (const name of ["stripe", "github"]) sources.set(name, {name, destination_url: process.env.DESTINATION_URL!, secret_env: "WG_SOURCE_TEST_SECRET", enabled: true});
     mocks.client = client;
 
     const ingest = await request(app)

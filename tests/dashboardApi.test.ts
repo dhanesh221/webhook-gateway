@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import request from "supertest";
 import jwt from "jsonwebtoken";
-import { SESSION_COOKIE } from "../src/auth";
+import { SESSION_COOKIE, issueSessionToken } from "../src/auth";
 import { makeFakeSupabase } from "./fakeSupabase";
 
 // One shared fake per test, swapped in through this holder so the module mock
@@ -16,10 +16,8 @@ import { app } from "../src/app";
 
 const TEST_SECRET = "test-session-secret";
 
-function authCookie(): string {
-  return `${SESSION_COOKIE}=${jwt.sign({ sub: "admin" }, TEST_SECRET, {
-    expiresIn: 3600,
-  })}`;
+async function authCookie(): Promise<string> {
+  return `${SESSION_COOKIE}=${await issueSessionToken()}`;
 }
 
 const DEST = "http://localhost:4000/receive";
@@ -41,6 +39,7 @@ function seed() {
 
 beforeEach(() => {
   vi.stubEnv("SESSION_SECRET", TEST_SECRET);
+  vi.stubEnv("ADMIN_PASSWORD_HASH", "$2b$04$fake-version-for-token-tests");
   seed();
 });
 
@@ -59,7 +58,7 @@ describe("GET /api/events", () => {
   });
 
   it("returns every event when no status filter is given", async () => {
-    const res = await request(app).get("/api/events").set("Cookie", authCookie());
+    const res = await request(app).get("/api/events").set("Cookie", await authCookie());
 
     expect(res.status).toBe(200);
     expect(res.body.events).toHaveLength(3);
@@ -75,7 +74,7 @@ describe("GET /api/events", () => {
 
     const res = await request(app)
       .get("/api/events?status=dead_lettered")
-      .set("Cookie", authCookie());
+      .set("Cookie", await authCookie());
 
     expect(res.status).toBe(200);
     expect(rpc).toHaveBeenCalledWith("list_webhook_events", {
@@ -89,14 +88,14 @@ describe("GET /api/events", () => {
   it("sends p_status: null for an absent or empty filter", async () => {
     const rpc = vi.spyOn(holder.client as { rpc: () => unknown }, "rpc");
 
-    await request(app).get("/api/events").set("Cookie", authCookie());
+    await request(app).get("/api/events").set("Cookie", await authCookie());
     expect(rpc).toHaveBeenLastCalledWith("list_webhook_events", {
       p_status: null,
       p_limit: 100,
     });
 
     // The dashboard's "All" option submits status= with an empty value.
-    await request(app).get("/api/events?status=").set("Cookie", authCookie());
+    await request(app).get("/api/events?status=").set("Cookie", await authCookie());
     expect(rpc).toHaveBeenLastCalledWith("list_webhook_events", {
       p_status: null,
       p_limit: 100,
@@ -108,17 +107,17 @@ describe("GET /api/events", () => {
 
     const res = await request(app)
       .get("/api/events?status=dead-lettered")
-      .set("Cookie", authCookie());
+      .set("Cookie", await authCookie());
 
     expect(res.status).toBe(400);
     expect(res.body.error).toContain("dead_lettered");
-    expect(rpc).not.toHaveBeenCalled();
+    expect(rpc).not.toHaveBeenCalledWith("list_webhook_events", expect.anything());
   });
 
   it("omits payload and headers from the response", async () => {
     // Payloads can be ~100 KB each and none of them are rendered; sending 100
     // of them would make a multi-megabyte response for a table of five columns.
-    const res = await request(app).get("/api/events").set("Cookie", authCookie());
+    const res = await request(app).get("/api/events").set("Cookie", await authCookie());
 
     for (const event of res.body.events) {
       expect(event).not.toHaveProperty("payload");
@@ -129,11 +128,12 @@ describe("GET /api/events", () => {
   });
 
   it("500s with a generic message when the RPC errors", async () => {
-    holder.client = {
-      rpc: async () => ({ data: null, error: { message: "boom: connection to db-host-7 refused" } }),
-    };
+    const cookie = await authCookie();
+    const originalRpc = (holder.client as any).rpc;
+    (holder.client as any).rpc = async (fn: string, args: unknown) => fn === "list_webhook_events"
+      ? { data: null, error: { message: "boom: connection to db-host-7 refused" } } : originalRpc(fn, args);
 
-    const res = await request(app).get("/api/events").set("Cookie", authCookie());
+    const res = await request(app).get("/api/events").set("Cookie", cookie);
 
     expect(res.status).toBe(500);
     expect(res.body).toEqual({ error: "Failed to list events" });
@@ -158,7 +158,7 @@ describe("GET /api/circuit-breakers", () => {
 
     const res = await request(app)
       .get("/api/circuit-breakers")
-      .set("Cookie", authCookie());
+      .set("Cookie", await authCookie());
 
     expect(res.status).toBe(200);
     expect(rpc).toHaveBeenCalledWith("list_circuit_breakers");
@@ -174,7 +174,7 @@ describe("GET /api/circuit-breakers", () => {
   it("returns an empty list rather than erroring when no breakers exist", async () => {
     const res = await request(app)
       .get("/api/circuit-breakers")
-      .set("Cookie", authCookie());
+      .set("Cookie", await authCookie());
 
     expect(res.status).toBe(200);
     expect(res.body.breakers).toEqual([]);
@@ -199,7 +199,7 @@ describe("POST /api/events/:id/replay", () => {
 
     const res = await request(app)
       .post(`/api/events/${DEAD}/replay`)
-      .set("Cookie", authCookie());
+      .set("Cookie", await authCookie());
 
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({ status: "replayed", id: DEAD });
@@ -218,7 +218,7 @@ describe("POST /api/events/:id/replay", () => {
 
     const res = await request(app)
       .post(`/api/events/${PENDING}/replay`)
-      .set("Cookie", authCookie());
+      .set("Cookie", await authCookie());
 
     expect(res.status).toBe(409);
     expect(res.body.error).toContain("not dead-lettered");
@@ -229,7 +229,7 @@ describe("POST /api/events/:id/replay", () => {
   it("409s on an id that doesn't exist at all", async () => {
     const res = await request(app)
       .post("/api/events/99999999-9999-9999-9999-999999999999/replay")
-      .set("Cookie", authCookie());
+      .set("Cookie", await authCookie());
 
     expect(res.status).toBe(409);
     expect(res.body.error).toContain("not dead-lettered");
@@ -241,31 +241,32 @@ describe("POST /api/events/:id/replay", () => {
 
     const res = await request(app)
       .post("/api/events/not-a-uuid/replay")
-      .set("Cookie", authCookie());
+      .set("Cookie", await authCookie());
 
     expect(res.status).toBe(409);
     expect(rpc).not.toHaveBeenCalledWith("replay_webhook_event", expect.anything());
   });
 
   it("is not repeatable — a second replay of the same event 409s", async () => {
-    await request(app).post(`/api/events/${DEAD}/replay`).set("Cookie", authCookie());
+    await request(app).post(`/api/events/${DEAD}/replay`).set("Cookie", await authCookie());
 
     const second = await request(app)
       .post(`/api/events/${DEAD}/replay`)
-      .set("Cookie", authCookie());
+      .set("Cookie", await authCookie());
 
     expect(second.status).toBe(409);
     expect(second.body.error).toContain("already replayed");
   });
 
   it("500s with a generic message when the lookup RPC errors", async () => {
-    holder.client = {
-      rpc: async () => ({ data: null, error: { message: "internal detail" } }),
-    };
+    const cookie = await authCookie();
+    const originalRpc = (holder.client as any).rpc;
+    (holder.client as any).rpc = async (fn: string, args: unknown) => fn === "list_webhook_events"
+      ? { data: null, error: { message: "internal detail" } } : originalRpc(fn, args);
 
     const res = await request(app)
       .post(`/api/events/${DEAD}/replay`)
-      .set("Cookie", authCookie());
+      .set("Cookie", cookie);
 
     expect(res.status).toBe(500);
     expect(res.body).toEqual({ error: "Failed to look up event" });

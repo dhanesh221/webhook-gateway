@@ -1,10 +1,8 @@
 // Phase 5 dashboard API. Mounted at /api by src/app.ts.
 //
-// Everything here reads through the same SECURITY DEFINER RPC pattern the rest
-// of the project uses — the anon key still has no direct read rights on
-// webhook_events, so the dashboard reads via list_webhook_events /
-// list_circuit_breakers (migration `add_dashboard_read_functions`).
+// Database RPCs are restricted to the server-only service role by Phase A.
 import express from "express";
+import { asyncRoute } from "./asyncRoute";
 import {
   SESSION_COOKIE,
   SESSION_TTL_SECONDS,
@@ -12,6 +10,7 @@ import {
   requireAuth,
   sessionCookieOptions,
   verifyPassword,
+  revokeSession,
 } from "./auth";
 import { getSupabase } from "./supabase";
 
@@ -64,7 +63,7 @@ function projectEvent(row: Record<string, unknown>): WebhookEventRow {
 
 // --- Public routes ---------------------------------------------------------
 
-dashboardRouter.post("/login", async (req, res) => {
+dashboardRouter.post("/login", asyncRoute(async (req, res) => {
   const password = req.body?.password;
 
   // A wrong password, a missing password, and a non-string password all get the
@@ -74,26 +73,27 @@ dashboardRouter.post("/login", async (req, res) => {
     return res.status(401).json({ error: "Invalid credentials" });
   }
 
-  res.cookie(SESSION_COOKIE, issueSessionToken(), {
+  res.cookie(SESSION_COOKIE, await issueSessionToken(), {
     ...sessionCookieOptions(),
     maxAge: SESSION_TTL_SECONDS * 1000,
   });
 
   return res.json({ status: "ok" });
-});
+}));
 
 // Not behind requireAuth: clearing a cookie that's already invalid should still
 // work, and there's nothing to protect.
-dashboardRouter.post("/logout", (_req, res) => {
+dashboardRouter.post("/logout", asyncRoute(async (req, res) => {
+  await revokeSession(req);
   res.clearCookie(SESSION_COOKIE, sessionCookieOptions());
   return res.json({ status: "ok" });
-});
+}));
 
 // --- Everything below this line requires a valid session -------------------
 
 dashboardRouter.use(requireAuth);
 
-dashboardRouter.get("/events", async (req, res) => {
+dashboardRouter.get("/events", asyncRoute(async (req, res) => {
   const status = req.query.status;
 
   if (status !== undefined && status !== "") {
@@ -119,9 +119,9 @@ dashboardRouter.get("/events", async (req, res) => {
 
   const rows = (data ?? []) as Record<string, unknown>[];
   return res.json({ events: rows.map(projectEvent) });
-});
+}));
 
-dashboardRouter.get("/circuit-breakers", async (_req, res) => {
+dashboardRouter.get("/circuit-breakers", asyncRoute(async (_req, res) => {
   const { data, error } = await getSupabase().rpc("list_circuit_breakers");
 
   if (error) {
@@ -130,9 +130,9 @@ dashboardRouter.get("/circuit-breakers", async (_req, res) => {
   }
 
   return res.json({ breakers: data ?? [] });
-});
+}));
 
-dashboardRouter.post("/events/:id/replay", async (req, res) => {
+dashboardRouter.post("/events/:id/replay", asyncRoute(async (req, res) => {
   const id = req.params.id;
 
   // replay_webhook_event returns { data: null, error: null } whether it replayed
@@ -171,4 +171,4 @@ dashboardRouter.post("/events/:id/replay", async (req, res) => {
     id,
     message: "Reset to pending, attempts=0.",
   });
-});
+}));
