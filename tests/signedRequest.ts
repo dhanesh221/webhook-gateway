@@ -12,7 +12,7 @@ export default function signedRequest(app: Parameters<typeof request>[0]) {
       const send = test.send.bind(test);
       test.send = ((body: string | object | undefined) => {
         const raw = typeof body === "string" ? body : JSON.stringify(body);
-        test.set(SIGNATURE_HEADER, buildSignatureHeader(TEST_SOURCE_SECRET, Math.floor(Date.now()/1000), raw));
+        test.set(SIGNATURE_HEADER, buildSignatureHeader(TEST_SOURCE_SECRET, Math.floor(Date.now()/1000), raw, (test as unknown as { get(h: string): string | undefined }).get("Idempotency-Key")));
         return send(body);
       }) as typeof test.send;
     }
