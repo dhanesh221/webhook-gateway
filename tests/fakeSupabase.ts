@@ -29,6 +29,8 @@ import type { ClaimedWebhookEvent } from "../src/deliveryWorker";
 export interface FakeRow extends ClaimedWebhookEvent {
   status: string;
   idempotency_key?: string | null;
+  raw_body?: string | null;
+  claimed_at?: number | null;
 }
 
 interface FakeBreaker {
@@ -39,7 +41,7 @@ interface FakeBreaker {
 
 export function makeFakeSupabase(
   rows: ClaimedWebhookEvent[],
-  opts: { failureThreshold?: number; cooldownMs?: number } = {}
+  opts: { failureThreshold?: number; cooldownMs?: number; claimAgeMs?: number } = {}
 ) {
   const failureThreshold = opts.failureThreshold ?? 5;
   const cooldownMs = opts.cooldownMs ?? 60_000;
@@ -94,10 +96,17 @@ export function makeFakeSupabase(
             attempts: 0,
             payload: row.payload,
             destination_url: (row.destination_url ?? null) as string | null,
+            raw_body: (row.raw_body ?? null) as string | null,
             status: "pending",
           });
           return { data: null, error: null };
         },
+        select: (_cols: string) => ({
+          in: async (_col: string, ids: string[]) => ({
+            data: ids.filter((i) => table.has(i)).map((i) => ({ id: i, raw_body: table.get(i)!.raw_body ?? null })),
+            error: null,
+          }),
+        }),
       };
     },
 
@@ -134,10 +143,19 @@ export function makeFakeSupabase(
           for (const row of table.values()) {
             if (row.status === "pending") {
               row.status = "in_progress";
+              row.claimed_at = Date.now() - (opts.claimAgeMs ?? 0);
               claimed.push({ ...row });
             }
           }
           return { data: claimed, error: null };
+        }
+
+        case "reclaim_stale_webhook_events": {
+          const cutoff = Date.now() - (args!.p_stale_after_seconds as number) * 1000;
+          for (const row of table.values()) {
+            if (row.status === "in_progress" && (row.claimed_at ?? 0) < cutoff) row.status = "pending";
+          }
+          return { data: null, error: null };
         }
 
         case "mark_webhook_event_delivered": {
