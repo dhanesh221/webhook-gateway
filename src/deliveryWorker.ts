@@ -11,20 +11,30 @@ export interface ClaimedWebhookEvent {
 }
 
 export type DeliverResult = { ok: boolean; status?: number };
-export type DeliverFn = (url: string, payload: unknown) => Promise<DeliverResult>;
+// rawBody is the exact bytes the sender posted, when stored. Delivering it avoids
+// the JSON.parse/stringify round trip, which rounds integers beyond 2^53.
+export type DeliverFn = (url: string, payload: unknown, rawBody?: string | null) => Promise<DeliverResult>;
+
+// An event claimed (in_progress) for longer than this is assumed abandoned by a
+// crashed worker and returned to pending. Must exceed the longest plausible
+// batch: rows are delivered one at a time, each bounded by DELIVERY_TIMEOUT_MS.
+export const STALE_CLAIM_SECONDS = 10 * 60;
 
 const DELIVERY_TIMEOUT_MS = 10_000;
 
 // Real HTTP delivery. Injectable so tests can point it at a local server, or
 // (for the backoff-only cases) skip real network calls entirely.
-const defaultDeliver: DeliverFn = async (url, payload) => {
+const defaultDeliver: DeliverFn = async (url, payload, rawBody) => {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), DELIVERY_TIMEOUT_MS);
   try {
     const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
+      body: rawBody ?? JSON.stringify(payload),
+      // A redirect would send the payload somewhere the registry never approved.
+      // A 3xx is reported as a failed delivery instead.
+      redirect: "manual",
       signal: controller.signal,
     });
     return { ok: res.ok, status: res.status };
@@ -35,7 +45,7 @@ const defaultDeliver: DeliverFn = async (url, payload) => {
 
 export type BatchOutcome = {
   id: string;
-  outcome: "delivered" | "retry" | "dead_lettered" | "skipped";
+  outcome: "delivered" | "retry" | "dead_lettered" | "skipped" | "released";
   attempt: number;
 };
 
@@ -75,6 +85,7 @@ export async function processPendingBatch(
   supabase: SupabaseClient,
   deliver: DeliverFn = defaultDeliver
 ): Promise<BatchOutcome[]> {
+  await reclaimStaleEvents(supabase);
   const { data, error } = await supabase.rpc("claim_pending_webhook_events");
 
   if (error) {
@@ -84,8 +95,40 @@ export async function processPendingBatch(
 
   const rows = (data ?? []) as ClaimedWebhookEvent[];
   const results: BatchOutcome[] = [];
+  const rawBodies = await fetchRawBodies(supabase, rows.map((r) => r.id));
 
   for (const row of rows) {
+    try {
+      await processRow(supabase, deliver, row, rawBodies.get(row.id) ?? null, results);
+    } catch (err) {
+      // One bad row must not strand it and every later claimed row in
+      // in_progress. Hand it back to pending without spending an attempt.
+      console.error(`[worker] event ${row.id}: unexpected error (${(err as Error).message}), releasing`);
+      try {
+        const { error: relError } = await supabase.rpc("mark_webhook_event_skipped", {
+          p_id: row.id,
+          p_next_attempt_at: new Date(Date.now() + 5_000).toISOString(),
+        });
+        if (relError) throw new Error(relError.message);
+      } catch (relErr) {
+        console.error(
+          `[worker] event ${row.id}: release failed (${(relErr as Error).message}); stale-claim recovery will return it`
+        );
+      }
+      results.push({ id: row.id, outcome: "released", attempt: row.attempts });
+    }
+  }
+
+  return results;
+}
+
+async function processRow(
+  supabase: SupabaseClient,
+  deliver: DeliverFn,
+  row: ClaimedWebhookEvent,
+  rawBody: string | null,
+  results: BatchOutcome[]
+): Promise<void> {
     const attemptNumber = row.attempts + 1;
 
     if (!row.destination_url) {
@@ -93,7 +136,7 @@ export async function processPendingBatch(
         `[worker] event ${row.id} attempt ${attemptNumber}: no destination_url set, treating as failure`
       );
       results.push(await retryOrDeadLetter(supabase, row, attemptNumber));
-      continue;
+      return;
     }
 
     const breaker = await getCircuitBreakerState(supabase, row.destination_url);
@@ -114,7 +157,7 @@ export async function processPendingBatch(
           `[worker] circuit open for ${row.destination_url}, skipping event ${row.id} until ${breaker.next_probe_at}`
         );
         results.push({ id: row.id, outcome: "skipped", attempt: row.attempts });
-        continue;
+        return;
       }
 
       console.log(
@@ -124,7 +167,7 @@ export async function processPendingBatch(
 
     let result: DeliverResult;
     try {
-      result = await deliver(row.destination_url, row.payload);
+      result = await deliver(row.destination_url, row.payload, rawBody);
     } catch (err) {
       result = { ok: false };
       console.log(
@@ -165,9 +208,42 @@ export async function processPendingBatch(
         );
       }
     }
-  }
+}
 
-  return results;
+// The claim RPC's column list lives in the database, so raw_body is read with a
+// separate query. If that fails the event is still delivered, from the parsed
+// payload, as before.
+async function fetchRawBodies(supabase: SupabaseClient, ids: string[]): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  if (ids.length === 0) return out;
+  try {
+    const { data, error } = await supabase.from("webhook_events").select("id, raw_body").in("id", ids);
+    if (error) throw new Error(error.message);
+    for (const r of (data ?? []) as { id: string; raw_body: string | null }[]) {
+      if (typeof r.raw_body === "string" && r.raw_body.length > 0) out.set(r.id, r.raw_body);
+    }
+  } catch (err) {
+    console.error(`[worker] could not read raw bodies (${(err as Error).message}); delivering re-serialised payloads`);
+  }
+  return out;
+}
+
+let reclaimUnavailableLogged = false;
+
+// Returns events stuck in in_progress (worker crashed after claiming) to pending.
+// Needs reclaim_stale_webhook_events from migrations/009; absent, it logs once.
+export async function reclaimStaleEvents(supabase: SupabaseClient): Promise<void> {
+  try {
+    const { error } = await supabase.rpc("reclaim_stale_webhook_events", {
+      p_stale_after_seconds: STALE_CLAIM_SECONDS,
+    });
+    if (error) throw new Error(error.message);
+  } catch (err) {
+    if (!reclaimUnavailableLogged) {
+      reclaimUnavailableLogged = true;
+      console.error(`[worker] stale-claim recovery unavailable (${(err as Error).message}); apply migrations/009`);
+    }
+  }
 }
 
 async function retryOrDeadLetter(
