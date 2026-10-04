@@ -29,17 +29,37 @@ export function signPayload(
     .digest("hex");
 }
 
+// v2 also covers the Idempotency-Key. Without that, a captured signed request
+// could be resent with a different key and be stored as a new event. The fields
+// are newline-delimited (a header value cannot contain a newline, and the
+// timestamp is digits only), with a version prefix so a v2 MAC can never be
+// confused with a v1 MAC.
+export function signPayloadV2(
+  secret: string,
+  timestampSeconds: number,
+  idempotencyKey: string,
+  rawBody: string
+): string {
+  return createHmac("sha256", secret)
+    .update(`v2\n${timestampSeconds}\n${idempotencyKey}\n${rawBody}`)
+    .digest("hex");
+}
+
 // Builds the full header value a sender would send.
 export function buildSignatureHeader(
   secret: string,
   timestampSeconds: number,
-  rawBody: string
+  rawBody: string,
+  idempotencyKey?: string | null
 ): string {
+  if (idempotencyKey) {
+    return `t=${timestampSeconds},v2=${signPayloadV2(secret, timestampSeconds, idempotencyKey, rawBody)}`;
+  }
   return `t=${timestampSeconds},v1=${signPayload(secret, timestampSeconds, rawBody)}`;
 }
 
-function parseHeader(header: string): { t?: string; v1?: string } {
-  const parts: { t?: string; v1?: string } = {};
+function parseHeader(header: string): { t?: string; v1?: string; v2?: string } {
+  const parts: { t?: string; v1?: string; v2?: string } = {};
   for (const segment of header.split(",")) {
     const index = segment.indexOf("=");
     if (index === -1) continue;
@@ -47,6 +67,7 @@ function parseHeader(header: string): { t?: string; v1?: string } {
     const value = segment.slice(index + 1).trim();
     if (key === "t") { if (parts.t !== undefined) return {}; parts.t = value; }
     if (key === "v1") { if (parts.v1 !== undefined) return {}; parts.v1 = value; }
+    if (key === "v2") { if (parts.v2 !== undefined) return {}; parts.v2 = value; }
   }
   return parts;
 }
@@ -68,6 +89,7 @@ export function verifySignature(opts: {
   secret: string;
   header: string | undefined;
   rawBody: string;
+  idempotencyKey?: string | null;
   nowSeconds?: number;
   toleranceSeconds?: number;
 }): VerifyResult {
@@ -75,14 +97,18 @@ export function verifySignature(opts: {
     secret,
     header,
     rawBody,
+    idempotencyKey = null,
     nowSeconds = Math.floor(Date.now() / 1000),
     toleranceSeconds = DEFAULT_TOLERANCE_SECONDS,
   } = opts;
 
   if (!header) return { ok: false, reason: "missing signature header" };
 
-  const { t, v1 } = parseHeader(header);
-  if (!t || !v1) return { ok: false, reason: "malformed signature header" };
+  const { t, v1, v2 } = parseHeader(header);
+  // A request carrying an Idempotency-Key must use v2, so the key is signed.
+  // v1 is accepted only for requests with no key.
+  const mac = idempotencyKey ? v2 : (v2 ?? v1);
+  if (!t || !mac) return { ok: false, reason: "malformed signature header" };
 
   const timestamp = Number(t);
   if (!/^\d+$/.test(t) || !Number.isSafeInteger(timestamp)) {
@@ -95,8 +121,11 @@ export function verifySignature(opts: {
     return { ok: false, reason: "signature timestamp outside tolerance" };
   }
 
-  const expected = signPayload(secret, timestamp, rawBody);
-  if (!/^[0-9a-fA-F]{64}$/.test(v1) || !safeEqualHex(expected, v1)) {
+  const useV2 = idempotencyKey ? true : v2 !== undefined;
+  const expected = useV2
+    ? signPayloadV2(secret, timestamp, idempotencyKey ?? "", rawBody)
+    : signPayload(secret, timestamp, rawBody);
+  if (!/^[0-9a-fA-F]{64}$/.test(mac) || !safeEqualHex(expected, mac)) {
     return { ok: false, reason: "signature mismatch" };
   }
 

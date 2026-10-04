@@ -13,6 +13,7 @@ import {
   revokeSession,
 } from "./auth";
 import { getSupabase } from "./supabase";
+import { loginRetryAfterSeconds, recordLoginFailure, recordLoginSuccess } from "./loginThrottle";
 
 export const dashboardRouter = express.Router();
 
@@ -65,13 +66,23 @@ function projectEvent(row: Record<string, unknown>): WebhookEventRow {
 
 dashboardRouter.post("/login", asyncRoute(async (req, res) => {
   const password = req.body?.password;
+  const client = req.ip ?? "unknown";
+
+  // Checked before bcrypt so a blocked caller costs us nothing.
+  const wait = loginRetryAfterSeconds(client);
+  if (wait > 0) {
+    res.set("Retry-After", String(wait));
+    return res.status(429).json({ error: "Too many failed attempts, try again later" });
+  }
 
   // A wrong password, a missing password, and a non-string password all get the
   // same answer. Anything more specific tells an attacker which half of the
   // guess was wrong.
   if (typeof password !== "string" || !(await verifyPassword(password))) {
+    recordLoginFailure(client);
     return res.status(401).json({ error: "Invalid credentials" });
   }
+  recordLoginSuccess(client);
 
   res.cookie(SESSION_COOKIE, await issueSessionToken(), {
     ...sessionCookieOptions(),
