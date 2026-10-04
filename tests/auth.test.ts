@@ -12,6 +12,7 @@ vi.mock("../src/supabase", () => ({ getSupabase: () => holder.client }));
 import { issueSessionToken } from "../src/auth";
 
 import { app } from "../src/app";
+import { resetLoginThrottle } from "../src/loginThrottle";
 
 const TEST_SECRET = "test-session-secret";
 const TEST_PASSWORD = "correct-horse-battery-staple";
@@ -33,6 +34,8 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllEnvs();
 });
+
+beforeEach(() => resetLoginThrottle());
 
 describe("requireAuth middleware", () => {
   // A tiny app rather than the real one, so the middleware is tested in
