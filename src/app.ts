@@ -58,6 +58,12 @@ app.post("/webhooks/:source", asyncRoute(async (req, res) => {
     });
   }
 
+  // Only JSON is parsed. Anything else has no raw body to verify, so say so
+  // instead of reporting a misleading signature failure.
+  if (!req.is("application/json")) {
+    return res.status(415).json({ error: "Content-Type must be application/json" });
+  }
+
   const route = await getSource(source);
   if (!route || !route.enabled) return res.status(404).json({ error: "Source unavailable" });
   // Configuration failures are 503, not an unsigned fallback. Never disclose
@@ -73,6 +79,7 @@ app.post("/webhooks/:source", asyncRoute(async (req, res) => {
   const result = verifySignature({
     secret: signingSecret, header: req.header(SIGNATURE_HEADER),
     rawBody: (req as RawBodyRequest).rawBody ?? "",
+    idempotencyKey,
   });
   if (!result.ok) {
     console.warn(`[ingest] rejected ${source}: ${result.reason}`);
@@ -98,6 +105,9 @@ app.post("/webhooks/:source", asyncRoute(async (req, res) => {
       headers: Object.fromEntries(Object.entries(req.headers).filter(([key]) =>
         ![SIGNATURE_HEADER, "authorization", "cookie"].includes(key))),
       payload,
+      // Exact bytes received. The worker delivers these, so numbers beyond
+      // 2^53 and the sender's formatting survive. Needs migrations/009.
+      raw_body: (req as RawBodyRequest).rawBody ?? "",
       status: "pending",
       destination_url: destinationUrl,
     });
