@@ -40,6 +40,8 @@ X-Webhook-Signature: t=<unix-seconds>,v1=<64-character hex HMAC-SHA256>
 
 Sign the exact UTF-8 body as `${timestamp}.${rawBody}` with the source secret. Timestamps more than five minutes from the server clock are rejected. Duplicate signature fields, invalid timestamps, malformed hashes, body tampering and wrong-source secrets are rejected. Comparisons are constant-time. Signed requests can still be replayed within five minutes; supply an idempotency key to deduplicate them.
 
+If you send an `Idempotency-Key`, sign it too, using the `v2` form: header `t=<timestamp>,v2=<hex>` where the MAC is HMAC-SHA256 over `"v2\n" + timestamp + "\n" + key + "\n" + rawBody`. A request carrying a key with a `v1` signature is rejected, so a captured request cannot be resent under a different key. Requests without a key keep using `t=...,v1=...` unchanged.
+
 This is a **custom protocol**, not a native GitHub or Stripe adapter. GitHub's `X-Hub-Signature-256` and Stripe's `Stripe-Signature` are not accepted directly. Provider-specific adapters are future work; a label named `stripe` does not make this Stripe-compatible.
 
 Authentication headers (`X-Webhook-Signature`, `Authorization`, `Cookie`) are excluded from stored event headers. Payloads and other headers may still contain sensitive data; set retention and access rules accordingly.
@@ -120,7 +122,7 @@ Tests use fake Supabase RPC storage and real local HTTP receivers. They cover ro
 ## HTTP endpoints
 
 - `GET /health`: public, `200 {"status":"ok"}`. Liveness only, not a database readiness check.
-- `POST /webhooks/:source`: non-empty JSON body, 1 MB cap; source is 1-64 letters/digits/underscore/hyphen. `202` stored, `200` duplicate, `400` invalid input, `401` invalid signature, `404` unknown/disabled source, `413` oversized body, `503` unusable source configuration, `500` storage/server failure.
+- `POST /webhooks/:source`: non-empty JSON body, 1 MB cap; source is 1-64 letters/digits/underscore/hyphen. `202` stored, `200` duplicate, `400` invalid input, `401` invalid signature, `415` body is not `application/json`, `404` unknown/disabled source, `413` oversized body, `503` unusable source configuration, `500` storage/server failure.
 - `POST /api/login`: `{ "password": "..." }`; creates cookie after credential and durable-session storage success.
 - `POST /api/logout`: revokes this session and clears cookie. Still works with no/invalid cookie; reports failure if revocation storage is unavailable.
 - `GET /api/events?status=...`: authenticated event table, latest 100; valid filters `pending`, `in_progress`, `delivered`, `failed`, `dead_lettered`. Payloads/headers excluded from dashboard response.
@@ -149,3 +151,13 @@ Tests use fake Supabase RPC storage and real local HTTP receivers. They cover ro
 ### Dependency audit at Phase A review
 
 `npm audit --omit=dev` reported five pre-existing runtime vulnerabilities (three moderate, two high), involving localtunnel's axios and `qs` through Express/body-parser. No forced downgrade was applied. Treat localtunnel as development-only; resolve the dependency audit before public deployment. Phase A adds no runtime dependencies.
+
+## Delivery safety (migration 009)
+
+Apply `migrations/009_crash_safety_raw_body.sql` before running this version; ingest writes the new `raw_body` column and fails without it.
+
+- Events are delivered as the exact bytes received, so integers above 2^53 and the sender's formatting arrive intact. Rows stored before the migration fall back to the parsed payload.
+- A failure while handling one claimed event releases that event to `pending` instead of leaving it, and the rest of the batch, in `in_progress`.
+- Events left `in_progress` for more than ten minutes (a crashed worker) are returned to `pending` on the next poll. Attempts are not incremented, so such an event can be delivered a second time; receivers should tolerate duplicates.
+- Delivery does not follow redirects; a 3xx counts as a failed attempt.
+- Dashboard login allows 5 failed attempts per client address per 15 minutes (50 across all clients), then answers `429` with `Retry-After`. The counters are in memory and reset on restart.
