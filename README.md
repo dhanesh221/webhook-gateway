@@ -8,7 +8,7 @@ Status: Phase 7, production-polish work. Phase 6 (CLI + development tunnel) is c
 
 Ingest returns `202` after an event is stored. An optional `Idempotency-Key` deduplicates ingest within a source; a duplicate returns `200`. Without that header, repeated requests are separate events. The worker makes up to five attempts, with full-jitter exponential waits capped at five minutes. Failed events enter the DLQ, where they can be replayed.
 
-Delivery is **at least once**, not exactly once. If the destination accepts an event but the gateway fails before recording success, a retry may repeat the side effect. Downstream applications must implement their own deduplication. There is also no automatic recovery of an `in_progress` event abandoned by a crashed worker in the current database RPC contract. Review that before relying on unattended operation.
+Delivery is **at least once**, not exactly once. If the destination accepts an event but the gateway fails before recording success, a retry may repeat the side effect. Downstream applications must implement their own deduplication. An `in_progress` event abandoned by a crashed worker is returned to `pending` after ten minutes (migration 009) without using an attempt, so it may be delivered again.
 
 Circuit breakers are shared by destination URL: five consecutive failures open a breaker for 60 seconds, then a delivery probes it. Breaker skips do not consume event attempts. Sources using the same URL share a breaker.
 
@@ -20,7 +20,7 @@ Circuit breakers are shared by destination URL: five consecutive failures open a
 
 The signing secret itself is **not in the database**. `secret_env` references a server environment variable such as `WG_SOURCE_PAYMENTS_SECRET`. Its name must match `WG_SOURCE_[A-Z0-9_]+_SECRET`, and its value must contain at least 32 UTF-8 bytes. Generate a high-entropy value, not a 32-character human password. Use a different variable and secret for every source. The name convention does not enforce uniqueness across rows; operators are responsible for not sharing a secret.
 
-Destinations must be HTTPS. Loopback HTTP (`localhost`, `127.0.0.1`, or `::1`) is allowed only outside `NODE_ENV=production`. Embedded URL credentials and fragments are rejected. Only trusted operators may manage sources. This URL check is not an SSRF sandbox: DNS can resolve public-looking names to private addresses, and delivery follows redirects. Do not expose source management to untrusted tenants. Multi-subscriber routing should add a subscriptions table and separate per-subscriber delivery records, rather than treating one event's status as the status of several deliveries.
+Destinations must be HTTPS. Loopback HTTP (`localhost`, `127.0.0.1`, or `::1`) is allowed only outside `NODE_ENV=production`. Embedded URL credentials and fragments are rejected. Only trusted operators may manage sources. This URL check is not an SSRF sandbox: DNS can resolve public-looking names to private addresses. Delivery does not follow redirects; a 3xx counts as a failed attempt. Do not expose source management to untrusted tenants. Multi-subscriber routing should add a subscriptions table and separate per-subscriber delivery records, rather than treating one event's status as the status of several deliveries.
 
 ```bash
 npm run gateway -- sources set payments https://receiver.example/hook WG_SOURCE_PAYMENTS_SECRET
