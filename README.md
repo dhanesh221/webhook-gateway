@@ -108,7 +108,7 @@ npm run gateway -- --help
 npm run gateway -- start --no-tunnel
 ```
 
-`gateway start` runs server and worker in one process. Options: `--port <port>`, `--poll-interval <ms>`, `--no-tunnel`. Ctrl+C/SIGTERM shuts down the tunnel, server, then worker. `npm run dev` and `npm run worker` remain available separately. Avoid mixing old/new workers during migration.
+`gateway start` runs server and worker in one process. Options: `--port <port>`, `--poll-interval <ms>`, `--no-tunnel`. The worker waits a 2-second gap after each poll finishes before starting the next (set with `--poll-interval`), so polls never overlap. Ctrl+C/SIGTERM shuts down the tunnel, server, then worker. `npm run dev` and `npm run worker` remain available separately. Avoid mixing old/new workers during migration.
 
 Localtunnel is a development convenience: its URL is ephemeral, may show an interstitial, and is not a stable production endpoint. `start` opens a tunnel unless `--no-tunnel` is passed. Using a tunnel does not make the custom signatures compatible with a provider. No new paid service is required for Phase A.
 
@@ -133,7 +133,7 @@ Tests use fake Supabase RPC storage and real local HTTP receivers. They cover ro
 ## Remaining work before a public service
 
 - Recover and version the original database schema/RPC migrations; verify this upgrade against the actual Supabase project, especially role privileges.
-- Add abandoned-claim recovery/leases, stable event IDs in downstream delivery and downstream idempotency. Investigate overlapping poll/probe concurrency before scaling workers.
+- Add abandoned-claim recovery/leases, stable event IDs in downstream delivery and downstream idempotency. Polls within one worker no longer overlap; investigate circuit-breaker probe concurrency across multiple worker processes before scaling workers.
 - Add provider-native signature adapters and outbound signing, destination controls appropriate for any multi-tenant use, stronger identity/rate limiting, retention, metrics and stable HTTPS hosting.
 - Keep secrets separate from browser assets and logs. Service-role access has broad privileges; scope operational access to this dedicated gateway database.
 
