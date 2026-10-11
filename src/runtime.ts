@@ -53,10 +53,13 @@ export function startServer(port: number): Promise<ServerHandle> {
 }
 
 // Same poll loop src/worker.ts has always run, wrapped so it can be stopped.
-// close() awaits any in-flight poll so shutdown doesn't cut a delivery attempt
-// off between "HTTP request sent" and "outcome recorded in the database".
+// Polls run strictly one at a time: the next is scheduled only after the previous
+// one settles, with intervalMs as the idle gap between them. close() awaits any
+// in-flight poll so shutdown doesn't cut a delivery attempt off between "HTTP
+// request sent" and "outcome recorded in the database".
 export function startWorker(intervalMs: number = DEFAULT_POLL_INTERVAL_MS): WorkerHandle {
   let stopped = false;
+  let timer: NodeJS.Timeout | undefined;
 
   async function tick(): Promise<void> {
     if (stopped) return;
@@ -67,15 +70,18 @@ export function startWorker(intervalMs: number = DEFAULT_POLL_INTERVAL_MS): Work
     }
   }
 
-  let inFlight: Promise<void> = tick();
-  const timer = setInterval(() => {
-    inFlight = tick();
-  }, intervalMs);
+  let inFlight: Promise<void> = Promise.resolve();
+  function poll(): void {
+    inFlight = tick().then(() => {
+      if (!stopped) timer = setTimeout(poll, intervalMs);
+    });
+  }
+  poll();
 
   return {
     close: async () => {
       stopped = true;
-      clearInterval(timer);
+      clearTimeout(timer);
       await inFlight;
     },
   };
