@@ -133,7 +133,7 @@ Tests use fake Supabase RPC storage and real local HTTP receivers. They cover ro
 ## Remaining work before a public service
 
 - Recover and version the original database schema/RPC migrations; verify this upgrade against the actual Supabase project, especially role privileges.
-- Add abandoned-claim recovery/leases, stable event IDs in downstream delivery and downstream idempotency. Investigate overlapping poll/probe concurrency before scaling workers.
+- Add abandoned-claim recovery/leases, stable event IDs in downstream delivery and downstream idempotency. Polls within one worker no longer overlap; investigate circuit-breaker probe concurrency across multiple worker processes before scaling workers.
 - Add provider-native signature adapters and outbound signing, destination controls appropriate for any multi-tenant use, stronger identity/rate limiting, retention, metrics and stable HTTPS hosting.
 - Keep secrets separate from browser assets and logs. Service-role access has broad privileges; scope operational access to this dedicated gateway database.
 
