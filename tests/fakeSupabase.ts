@@ -264,4 +264,4 @@ export function makeFakeSupabase(
   };
 
   return { client: client as unknown as SupabaseClient, table, breakers, sources, sessions };
-    }
+}
