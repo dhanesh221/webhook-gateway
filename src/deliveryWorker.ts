@@ -95,11 +95,19 @@ export async function processPendingBatch(
 
   const rows = (data ?? []) as ClaimedWebhookEvent[];
   const results: BatchOutcome[] = [];
-  const rawBodies = await fetchRawBodies(supabase, rows.map((r) => r.id));
+  let rawBodies: Map<string, string | null> | undefined;
+  try {
+    rawBodies = await fetchRawBodies(supabase, rows.map((r) => r.id));
+  } catch (err) {
+    console.error(`[worker] could not read raw bodies (${(err as Error).message}); releasing batch`);
+  }
 
   for (const row of rows) {
     try {
-      await processRow(supabase, deliver, row, rawBodies.get(row.id) ?? null, results);
+      // An unreadable or missing row is not a legacy NULL body. Never rebuild
+      // it from parsed JSON: that can silently round the sender's large IDs.
+      if (!rawBodies?.has(row.id)) throw new Error("Stored raw body unavailable");
+      await processRow(supabase, deliver, row, rawBodies.get(row.id)!, results);
     } catch (err) {
       // One bad row must not strand it and every later claimed row in
       // in_progress. Hand it back to pending without spending an attempt.
@@ -211,19 +219,14 @@ async function processRow(
 }
 
 // The claim RPC's column list lives in the database, so raw_body is read with a
-// separate query. If that fails the event is still delivered, from the parsed
-// payload, as before.
-async function fetchRawBodies(supabase: SupabaseClient, ids: string[]): Promise<Map<string, string>> {
-  const out = new Map<string, string>();
+// separate query. Only an explicit NULL permits legacy JSON re-serialization.
+async function fetchRawBodies(supabase: SupabaseClient, ids: string[]): Promise<Map<string, string | null>> {
+  const out = new Map<string, string | null>();
   if (ids.length === 0) return out;
-  try {
-    const { data, error } = await supabase.from("webhook_events").select("id, raw_body").in("id", ids);
-    if (error) throw new Error(error.message);
-    for (const r of (data ?? []) as { id: string; raw_body: string | null }[]) {
-      if (typeof r.raw_body === "string" && r.raw_body.length > 0) out.set(r.id, r.raw_body);
-    }
-  } catch (err) {
-    console.error(`[worker] could not read raw bodies (${(err as Error).message}); delivering re-serialised payloads`);
+  const { data, error } = await supabase.from("webhook_events").select("id, raw_body").in("id", ids);
+  if (error) throw new Error(error.message);
+  for (const r of (data ?? []) as { id: string; raw_body: string | null }[]) {
+    if (r.raw_body === null || typeof r.raw_body === "string") out.set(r.id, r.raw_body);
   }
   return out;
 }
