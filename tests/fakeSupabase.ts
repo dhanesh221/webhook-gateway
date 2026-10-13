@@ -102,6 +102,9 @@ export function makeFakeSupabase(
           return { data: null, error: null };
         },
         select: (_cols: string) => ({
+          limit: (_count: number) => ({
+            abortSignal: async (_signal: AbortSignal) => ({ data: [], error: null }),
+          }),
           in: async (_col: string, ids: string[]) => ({
             data: ids.filter((i) => table.has(i)).map((i) => ({ id: i, raw_body: table.get(i)!.raw_body ?? null })),
             error: null,
@@ -261,4 +264,4 @@ export function makeFakeSupabase(
   };
 
   return { client: client as unknown as SupabaseClient, table, breakers, sources, sessions };
-}
+    }
