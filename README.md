@@ -121,7 +121,7 @@ Tests use fake Supabase RPC storage and real local HTTP receivers. They cover ro
 
 ## HTTP endpoints
 
-- `GET /health`: public, `200 {"status":"ok"}`. Liveness only, not a database readiness check.
+- `GET /health`: public readiness check. Returns `200 {"status":"ok"}` when the database accepts a zero-row query for the ingest columns, including `raw_body`; returns `503 {"status":"unavailable"}` on missing schema, configuration or database access failure. The database request times out after 3 seconds. It creates no probe events. This detects a missing migration 009 column, but does not prove INSERT permissions, constraints or worker RPC readiness.
 - `POST /webhooks/:source`: non-empty JSON body, 1 MB cap; source is 1-64 letters/digits/underscore/hyphen. `202` stored, `200` duplicate, `400` invalid input, `401` invalid signature, `415` body is not `application/json`, `404` unknown/disabled source, `413` oversized body, `503` unusable source configuration, `500` storage/server failure.
 - `POST /api/login`: `{ "password": "..." }`; creates cookie after credential and durable-session storage success.
 - `POST /api/logout`: revokes this session and clears cookie. Still works with no/invalid cookie; reports failure if revocation storage is unavailable.
@@ -156,7 +156,7 @@ Tests use fake Supabase RPC storage and real local HTTP receivers. They cover ro
 
 Apply `migrations/009_crash_safety_raw_body.sql` before running this version; ingest writes the new `raw_body` column and fails without it.
 
-- Events are delivered as the exact bytes received, so integers above 2^53 and the sender's formatting arrive intact. Rows stored before the migration fall back to the parsed payload.
+- Events are delivered as the exact bytes received, so integers above 2^53 and the sender's formatting arrive intact. Rows with an explicit NULL raw body (stored before the migration) fall back to the parsed payload. A failed raw-body read releases the batch for retry without spending delivery attempts; a missing or unreadable row is released too. No parsed-payload fallback is used on a read failure.
 - A failure while handling one claimed event releases that event to `pending` instead of leaving it, and the rest of the batch, in `in_progress`.
 - Events left `in_progress` for more than ten minutes (a crashed worker) are returned to `pending` on the next poll. Attempts are not incremented, so such an event can be delivered a second time; receivers should tolerate duplicates.
 - Delivery does not follow redirects; a 3xx counts as a failed attempt.

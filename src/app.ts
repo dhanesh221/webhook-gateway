@@ -41,9 +41,23 @@ app.use(
 );
 app.use(cookieParser());
 
-app.get("/health", (_req, res) => {
-  res.json({ status: "ok" });
-});
+// Readiness, not just process liveness. A zero-row query verifies the ingest
+// columns (including migration 009's raw_body) without creating probe events.
+// It does not prove INSERT grants, constraints or all worker RPCs are valid.
+app.get("/health", asyncRoute(async (_req, res) => {
+  try {
+    const { error } = await getSupabase()
+      .from("webhook_events")
+      .select("id, source, idempotency_key, headers, payload, raw_body, status, destination_url")
+      .limit(0)
+      .abortSignal(AbortSignal.timeout(3_000));
+    if (error) throw new Error(error.message);
+    return res.json({ status: "ok" });
+  } catch {
+    // Do not expose database errors, credentials or schema details publicly.
+    return res.status(503).json({ status: "unavailable" });
+  }
+}));
 
 // Receives a webhook from an external provider and stores it for later delivery.
 // Responds immediately — actual delivery is the Phase 3 worker's job.
