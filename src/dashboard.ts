@@ -43,6 +43,7 @@ interface WebhookEventRow {
   updated_at: string;
   destination_url: string | null;
   next_attempt_at: string | null;
+  fanout_group_id?: string;
 }
 
 // The RPC returns full rows, payload and headers included. Those are never
@@ -59,6 +60,7 @@ function projectEvent(row: Record<string, unknown>): WebhookEventRow {
     updated_at: row.updated_at as string,
     destination_url: (row.destination_url ?? null) as string | null,
     next_attempt_at: (row.next_attempt_at ?? null) as string | null,
+    ...(row.fanout_group_id ? { fanout_group_id: row.fanout_group_id as string } : {}),
   };
 }
 
