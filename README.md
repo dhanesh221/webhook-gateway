@@ -136,6 +136,21 @@ npm run gateway -- dlq replay <event-id>
 
 Tests use fake Supabase RPC storage and real local HTTP receivers. They cover routing, source isolation, signing, idempotency, retries, DLQ/replay, breakers, session creation/revocation and failure handling. Passing these tests is not a live Supabase migration or deployment check.
 
+## Delivery rate limits
+
+Each worker process uses a token bucket per exact destination URL. Defaults are 10 requests/second with a burst of 10. One outgoing attempt spends one token, including failed requests. If no token is available, the event returns to `pending` with `next_attempt_at` set to the next token time; attempts are unchanged. The worker does not sleep while holding a claim, so other destinations can continue. Actual delivery can be later than that time because of polling and queue load.
+
+```dotenv
+WG_DELIVERY_RATE_RPS=10
+WG_DELIVERY_RATE_BURST=10
+# Exact stored destination URLs, including path and trailing slash:
+WG_DELIVERY_RATE_OVERRIDES='{"https://receiver.example/hook":{"rps":2,"burst":4}}'
+```
+
+Configuration is read once per process. Restart after changing it. `rps` must be finite and between 0.001 and 10000; `burst` must be an integer between 1 and 10000. Zero does not disable limiting: invalid settings stop worker startup before any database claim. An override must supply both fields. Different paths at one host are separate destinations; sources with the same stored URL share a bucket.
+
+Refill uses a monotonic clock. Open circuit breakers defer without spending tokens; a due probe must still get a token. Rate deferral failures fall back to claim release/stale recovery, never unthrottled delivery. Buckets survive polls but not process restarts. Limits are **per process**, not a shared cap across workers or machines. Use a shared limiter before scaling out. At most 10000 active buckets are kept; capacity pressure defers new destinations until fully refilled buckets can be removed. Token buckets cap average rate and burst, not concurrent in-flight requests, and do not guarantee queue fairness.
+
 ## HTTP endpoints
 
 - `GET /health`: public readiness check. Returns `200 {"status":"ok"}` when the database accepts a zero-row query for the ingest columns, including `raw_body`; returns `503 {"status":"unavailable"}` on missing schema, configuration or database access failure. The database request times out after 3 seconds. It creates no probe events. This detects a missing migration 009 column, but does not prove INSERT permissions, constraints or worker RPC readiness.
