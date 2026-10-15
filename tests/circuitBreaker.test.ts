@@ -1,3 +1,4 @@
+import { TokenBuckets } from "../src/rateLimit";
 import { describe, it, expect, afterEach, vi } from "vitest";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
@@ -38,7 +39,7 @@ describe("circuit breaker", () => {
     const { client, table, breakers } = makeFakeSupabase(failingRows, { cooldownMs: 60_000 });
 
     for (let i = 0; i < 5; i++) {
-      await processPendingBatch(client);
+      await processPendingBatch(client, undefined, new TokenBuckets({ rps: 10000, burst: 10000 }));
     }
 
     expect(breakers.get(destinationUrl)?.state).toBe("open");
@@ -57,7 +58,7 @@ describe("circuit breaker", () => {
       status: "pending",
     });
 
-    const outcomes = await processPendingBatch(client);
+    const outcomes = await processPendingBatch(client, undefined, new TokenBuckets({ rps: 10000, burst: 10000 }));
 
     const sixthOutcome = outcomes.find((o) => o.id === "sixth");
     expect(sixthOutcome?.outcome).toBe("skipped");
@@ -96,7 +97,7 @@ describe("circuit breaker", () => {
     });
 
     for (let i = 0; i < 5; i++) {
-      await processPendingBatch(client);
+      await processPendingBatch(client, undefined, new TokenBuckets({ rps: 10000, burst: 10000 }));
     }
     expect(breakers.get(destinationUrl)?.state).toBe("open");
 
@@ -109,7 +110,7 @@ describe("circuit breaker", () => {
       destination_url: destinationUrl,
       status: "pending",
     });
-    let outcomes = await processPendingBatch(client);
+    let outcomes = await processPendingBatch(client, undefined, new TokenBuckets({ rps: 10000, burst: 10000 }));
     expect(outcomes.find((o) => o.id === "still-cooling")?.outcome).toBe("skipped");
 
     // Advance the fake clock past the cooldown, and make the destination succeed.
@@ -124,7 +125,7 @@ describe("circuit breaker", () => {
       status: "pending",
     });
 
-    outcomes = await processPendingBatch(client);
+    outcomes = await processPendingBatch(client, undefined, new TokenBuckets({ rps: 10000, burst: 10000 }));
     const probeOutcome = outcomes.find((o) => o.id === "probe-event");
     expect(probeOutcome?.outcome).toBe("delivered");
     expect(breakers.get(destinationUrl)?.state).toBe("closed");
@@ -139,7 +140,7 @@ describe("circuit breaker", () => {
       destination_url: destinationUrl,
       status: "pending",
     });
-    outcomes = await processPendingBatch(client);
+    outcomes = await processPendingBatch(client, undefined, new TokenBuckets({ rps: 10000, burst: 10000 }));
     expect(outcomes.find((o) => o.id === "resumed-event")?.outcome).toBe("delivered");
   });
 });

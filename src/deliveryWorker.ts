@@ -1,5 +1,6 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { computeBackoffDelay, MAX_ATTEMPTS } from "./backoff";
+import { defaultDeliveryLimiter, type DeliveryLimiter } from "./rateLimit";
 
 // Shape returned by the claim_pending_webhook_events RPC.
 export interface ClaimedWebhookEvent {
@@ -45,7 +46,7 @@ const defaultDeliver: DeliverFn = async (url, payload, rawBody) => {
 
 export type BatchOutcome = {
   id: string;
-  outcome: "delivered" | "retry" | "dead_lettered" | "skipped" | "released";
+  outcome: "delivered" | "retry" | "dead_lettered" | "skipped" | "released" | "rate_limited";
   attempt: number;
 };
 
@@ -83,7 +84,8 @@ async function getCircuitBreakerState(
 // invoked directly in tests without waiting on real timers.
 export async function processPendingBatch(
   supabase: SupabaseClient,
-  deliver: DeliverFn = defaultDeliver
+  deliver: DeliverFn = defaultDeliver,
+  limiter: DeliveryLimiter = defaultDeliveryLimiter()
 ): Promise<BatchOutcome[]> {
   await reclaimStaleEvents(supabase);
   const { data, error } = await supabase.rpc("claim_pending_webhook_events");
@@ -107,7 +109,7 @@ export async function processPendingBatch(
       // An unreadable or missing row is not a legacy NULL body. Never rebuild
       // it from parsed JSON: that can silently round the sender's large IDs.
       if (!rawBodies?.has(row.id)) throw new Error("Stored raw body unavailable");
-      await processRow(supabase, deliver, row, rawBodies.get(row.id)!, results);
+      await processRow(supabase, deliver, row, rawBodies.get(row.id)!, results, limiter);
     } catch (err) {
       // One bad row must not strand it and every later claimed row in
       // in_progress. Hand it back to pending without spending an attempt.
@@ -135,7 +137,8 @@ async function processRow(
   deliver: DeliverFn,
   row: ClaimedWebhookEvent,
   rawBody: string | null,
-  results: BatchOutcome[]
+  results: BatchOutcome[],
+  limiter: DeliveryLimiter
 ): Promise<void> {
     const attemptNumber = row.attempts + 1;
 
@@ -171,6 +174,17 @@ async function processRow(
       console.log(
         `[worker] circuit open for ${row.destination_url} but cooldown elapsed, attempting probe delivery for event ${row.id}`
       );
+    }
+
+    const waitMs = limiter.take(row.destination_url);
+    if (waitMs > 0) {
+      const { error } = await supabase.rpc("mark_webhook_event_skipped", {
+        p_id: row.id,
+        p_next_attempt_at: new Date(Date.now() + waitMs).toISOString(),
+      });
+      if (error) throw new Error("Failed to defer rate-limited event");
+      results.push({ id: row.id, outcome: "rate_limited", attempt: row.attempts });
+      return;
     }
 
     let result: DeliverResult;

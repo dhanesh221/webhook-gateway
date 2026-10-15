@@ -119,3 +119,16 @@ describe("startWorker", () => {
     expect(mocks.processPendingBatch).toHaveBeenCalledTimes(1);
   });
 });
+
+
+describe("worker rate configuration", () => {
+  it("rejects invalid configuration before polling", async () => {
+    vi.resetModules();
+    vi.stubEnv("WG_DELIVERY_RATE_RPS", "0");
+    try {
+      const { startWorker: freshStartWorker } = await import("../src/runtime");
+      expect(() => freshStartWorker()).toThrow("Delivery rate");
+      expect(mocks.processPendingBatch).not.toHaveBeenCalled();
+    } finally { vi.unstubAllEnvs(); }
+  });
+});
