@@ -13,7 +13,7 @@
 // gateway. Sending the `bypass-tunnel-reminder` header (any value) skips it,
 // and so does visiting the URL once in a browser from the same IP. Documented
 // in the README.
-import localtunnel from "localtunnel";
+
 
 export interface TunnelHandle {
   url: string;
@@ -21,6 +21,8 @@ export interface TunnelHandle {
 }
 
 export async function openTunnel(port: number): Promise<TunnelHandle> {
+  // Load the development-only dependency only when a tunnel is requested.
+  const { default: localtunnel } = await import("localtunnel");
   const tunnel = await localtunnel({ port });
 
   // A tunnel can drop long after it opened (loca.lt restarting, network blip).

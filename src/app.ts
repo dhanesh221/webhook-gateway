@@ -1,4 +1,5 @@
 import express from "express";
+import helmet from "helmet";
 import cookieParser from "cookie-parser";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -30,6 +31,15 @@ interface RawBodyRequest extends express.Request {
 
 // Separate from index.ts so tests can import the app without starting a real server.
 export const app = express();
+
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      // Keep HTTP localhost usable in development (including Safari).
+      "upgrade-insecure-requests": process.env.NODE_ENV === "production" ? [] : null,
+    },
+  },
+}));
 
 app.use(
   express.json({

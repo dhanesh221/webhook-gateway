@@ -235,14 +235,20 @@ describe("static dashboard files", () => {
     const res = await request(app).get("/login.html");
 
     expect(res.status).toBe(200);
-    expect(res.text).toContain("/api/login");
+    expect(res.text).toContain('src="/login.js"');
+    const script = await request(app).get("/login.js");
+    expect(script.status).toBe(200);
+    expect(script.text).toContain("/api/login");
   });
 
   it("serves the dashboard HTML unauthenticated (the data behind it is what's gated)", async () => {
     const res = await request(app).get("/dashboard.html");
 
     expect(res.status).toBe(200);
-    expect(res.text).toContain("/api/events");
+    expect(res.text).toContain('src="/dashboard.js"');
+    const script = await request(app).get("/dashboard.js");
+    expect(script.status).toBe(200);
+    expect(script.text).toContain("/api/events");
   });
 });
 
@@ -252,5 +258,17 @@ describe("pre-existing routes still work with auth in place", () => {
 
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ status: "ok" });
+  });
+});
+
+
+describe("security headers", () => {
+  it.each(["/login.html", "/dashboard.html", "/health", "/api/events"])("protects %s without allowing inline scripts", async (url) => {
+    const res = await request(app).get(url);
+    expect(res.headers["x-content-type-options"]).toBe("nosniff");
+    expect(res.headers["x-frame-options"]).toBe("SAMEORIGIN");
+    expect(res.headers["x-powered-by"]).toBeUndefined();
+    expect(res.headers["content-security-policy"]).toContain("script-src 'self'");
+    expect(res.headers["content-security-policy"]).not.toMatch(/script-src[^;]*'unsafe-inline'/);
   });
 });
