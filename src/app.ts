@@ -9,6 +9,7 @@ import { hasValidSession } from "./auth";
 import { verifySignature, SIGNATURE_HEADER } from "./signature";
 import { getSource, sourceSecret, SOURCE_PATTERN, validateDestination } from "./sources";
 import { asyncRoute } from "./asyncRoute";
+import { gatewayMetrics, hasMetricsBearer } from "./metrics";
 export { SOURCE_PATTERN } from "./sources";
 
 // Chosen deliberately rather than inherited. express.json() defaults to 100 KB,
@@ -50,6 +51,17 @@ app.use(
   })
 );
 app.use(cookieParser());
+
+// Operational counts are private. A separate bearer token allows Prometheus
+// to scrape without a dashboard cookie or a database round trip.
+app.get("/metrics", asyncRoute(async (req, res) => {
+  res.set("Cache-Control", "no-store");
+  if (!hasMetricsBearer(req.header("Authorization")) && !await hasValidSession(req)) {
+    return res.status(401).json({ error: "Not authenticated" });
+  }
+  res.set("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
+  return res.send(gatewayMetrics.render());
+}));
 
 // Readiness, not just process liveness. A zero-row query verifies the ingest
 // columns (including migration 009's raw_body) without creating probe events.
@@ -150,6 +162,7 @@ app.post("/webhooks/:source", asyncRoute(async (req, res) => {
     return res.status(500).json({ error: "Failed to store webhook event" });
   }
 
+  gatewayMetrics.increment("received", source, destinationUrl);
   return res.status(202).json({ id, status: "pending" });
 }));
 

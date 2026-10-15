@@ -2,6 +2,8 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import { computeBackoffDelay, MAX_ATTEMPTS } from "./backoff";
 import { defaultDeliveryLimiter, type DeliveryLimiter } from "./rateLimit";
 
+import { gatewayMetrics, type GatewayMetrics } from "./metrics";
+
 // Shape returned by the claim_pending_webhook_events RPC.
 export interface ClaimedWebhookEvent {
   id: string;
@@ -85,7 +87,8 @@ async function getCircuitBreakerState(
 export async function processPendingBatch(
   supabase: SupabaseClient,
   deliver: DeliverFn = defaultDeliver,
-  limiter: DeliveryLimiter = defaultDeliveryLimiter()
+  limiter: DeliveryLimiter = defaultDeliveryLimiter(),
+  metrics: GatewayMetrics = gatewayMetrics
 ): Promise<BatchOutcome[]> {
   await reclaimStaleEvents(supabase);
   const { data, error } = await supabase.rpc("claim_pending_webhook_events");
@@ -109,7 +112,7 @@ export async function processPendingBatch(
       // An unreadable or missing row is not a legacy NULL body. Never rebuild
       // it from parsed JSON: that can silently round the sender's large IDs.
       if (!rawBodies?.has(row.id)) throw new Error("Stored raw body unavailable");
-      await processRow(supabase, deliver, row, rawBodies.get(row.id)!, results, limiter);
+      await processRow(supabase, deliver, row, rawBodies.get(row.id)!, results, limiter, metrics);
     } catch (err) {
       // One bad row must not strand it and every later claimed row in
       // in_progress. Hand it back to pending without spending an attempt.
@@ -138,7 +141,8 @@ async function processRow(
   row: ClaimedWebhookEvent,
   rawBody: string | null,
   results: BatchOutcome[],
-  limiter: DeliveryLimiter
+  limiter: DeliveryLimiter,
+  metrics: GatewayMetrics
 ): Promise<void> {
     const attemptNumber = row.attempts + 1;
 
@@ -146,7 +150,8 @@ async function processRow(
       console.log(
         `[worker] event ${row.id} attempt ${attemptNumber}: no destination_url set, treating as failure`
       );
-      results.push(await retryOrDeadLetter(supabase, row, attemptNumber));
+      metrics.increment("failed", row.source, row.destination_url);
+      results.push(await retryOrDeadLetter(supabase, row, attemptNumber, metrics));
       return;
     }
 
@@ -198,6 +203,7 @@ async function processRow(
     }
 
     if (result.ok) {
+      metrics.increment("delivered", row.source, row.destination_url);
       const { error: markError } = await supabase.rpc("mark_webhook_event_delivered", {
         p_id: row.id,
       });
@@ -220,7 +226,8 @@ async function processRow(
           `[worker] event ${row.id} attempt ${attemptNumber}: destination responded ${result.status}`
         );
       }
-      results.push(await retryOrDeadLetter(supabase, row, attemptNumber));
+      metrics.increment("failed", row.source, row.destination_url);
+      results.push(await retryOrDeadLetter(supabase, row, attemptNumber, metrics));
       const { error: failureError } = await supabase.rpc("record_delivery_failure", {
         p_destination_url: row.destination_url,
       });
@@ -266,7 +273,8 @@ export async function reclaimStaleEvents(supabase: SupabaseClient): Promise<void
 async function retryOrDeadLetter(
   supabase: SupabaseClient,
   row: ClaimedWebhookEvent,
-  attemptNumber: number
+  attemptNumber: number,
+  metrics: GatewayMetrics
 ): Promise<BatchOutcome> {
   // computeBackoffDelay takes attempts-already-made (0-indexed), i.e. the count
   // before this failed attempt is recorded.
@@ -284,6 +292,7 @@ async function retryOrDeadLetter(
   }
 
   const outcome = attemptNumber >= MAX_ATTEMPTS ? "dead_lettered" : "retry";
+  if (!error) metrics.increment(outcome === "retry" ? "retried" : "dead_lettered", row.source, row.destination_url);
   console.log(
     outcome === "dead_lettered"
       ? `[worker] event ${row.id} attempt ${attemptNumber}: exceeded ${MAX_ATTEMPTS} attempts, dead-lettered`
