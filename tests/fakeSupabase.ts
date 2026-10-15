@@ -31,6 +31,7 @@ export interface FakeRow extends ClaimedWebhookEvent {
   idempotency_key?: string | null;
   raw_body?: string | null;
   claimed_at?: number | null;
+  fanout_group_id?: string | null;
 }
 
 interface FakeBreaker {
@@ -115,6 +116,23 @@ export function makeFakeSupabase(
 
     rpc: async (fn: string, args?: Record<string, unknown>) => {
       switch (fn) {
+        // Mirrors migrations/010: all children or none; first child keeps the key.
+        case "ingest_routed_webhook": {
+          const source = args!.p_source as string;
+          const key = (args!.p_idempotency_key ?? null) as string | null;
+          if (key !== null) {
+            for (const e of table.values()) if (e.source === source && e.idempotency_key === key) return { data: "duplicate", error: null };
+          }
+          (args!.p_children as { id: string; destination_url: string }[]).forEach((c, i) => {
+            table.set(c.id, {
+              id: c.id, source, idempotency_key: i === 0 ? key : null, attempts: 0,
+              payload: args!.p_payload, destination_url: c.destination_url,
+              raw_body: args!.p_raw_body as string, status: "pending",
+              fanout_group_id: args!.p_group_id as string,
+            });
+          });
+          return { data: "created", error: null };
+        }
         case "get_webhook_source": return { data: [sources.get(args!.p_name as string)].filter(Boolean), error: null };
         case "list_webhook_sources": return { data: [...sources.values()], error: null };
         case "upsert_webhook_source": {
