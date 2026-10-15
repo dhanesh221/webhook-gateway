@@ -9,6 +9,7 @@ import { hasValidSession } from "./auth";
 import { verifySignature, SIGNATURE_HEADER } from "./signature";
 import { getSource, sourceSecret, SOURCE_PATTERN, validateDestination } from "./sources";
 import { asyncRoute } from "./asyncRoute";
+import { loadRoutingRules, matchDestinations } from "./routing";
 import { gatewayMetrics, hasMetricsBearer } from "./metrics";
 export { SOURCE_PATTERN } from "./sources";
 
@@ -128,6 +129,41 @@ app.post("/webhooks/:source", asyncRoute(async (req, res) => {
       .json({ error: "Request body must be a non-empty JSON object" });
   }
 
+  // Routing config is re-validated on every ingest (cached by raw text). A
+  // malformed config fails closed: nothing is stored or delivered.
+  let routed: string[] = [];
+  try {
+    const config = loadRoutingRules();
+    if (config) routed = matchDestinations(config, source, payload);
+  } catch {
+    console.error("[ingest] routing configuration invalid");
+    return res.status(503).json({ error: "Source unavailable" });
+  }
+  const storedHeaders = Object.fromEntries(Object.entries(req.headers).filter(([key]) =>
+    ![SIGNATURE_HEADER, "authorization", "cookie"].includes(key)));
+
+  if (routed.length > 0) {
+    const groupId = randomUUID();
+    const children = routed.map((destination_url) => ({ id: randomUUID(), destination_url }));
+    const { data, error: rpcError } = await getSupabase().rpc("ingest_routed_webhook", {
+      p_group_id: groupId, p_source: source, p_idempotency_key: idempotencyKey,
+      p_headers: storedHeaders, p_payload: payload,
+      p_raw_body: (req as RawBodyRequest).rawBody ?? "", p_children: children,
+    });
+    if (rpcError) {
+      if (rpcError.code === "23505") return res.status(200).json({ status: "duplicate", message: "already received" });
+      return res.status(500).json({ error: "Failed to store webhook event" });
+    }
+    if (data === "duplicate") return res.status(200).json({ status: "duplicate", message: "already received" });
+    if (data !== "created") return res.status(500).json({ error: "Failed to store webhook event" });
+    // One source event, however many copies.
+    gatewayMetrics.increment("received", source, children[0].destination_url);
+    return res.status(202).json({
+      id: children[0].id, status: "pending",
+      ...(children.length > 1 ? { delivery_ids: children.map((c) => c.id) } : {}),
+    });
+  }
+
   // Generate the event ID before storage so the same ID is returned to the sender.
   const id = randomUUID();
 
@@ -138,8 +174,7 @@ app.post("/webhooks/:source", asyncRoute(async (req, res) => {
       source,
       idempotency_key: idempotencyKey,
       // Authentication material must not be retained in event history.
-      headers: Object.fromEntries(Object.entries(req.headers).filter(([key]) =>
-        ![SIGNATURE_HEADER, "authorization", "cookie"].includes(key))),
+      headers: storedHeaders,
       payload,
       // Exact bytes received. The worker delivers these, so numbers beyond
       // 2^53 and the sender's formatting survive. Needs migrations/009.
