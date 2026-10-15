@@ -11,6 +11,7 @@
 import type { Server } from "node:http";
 import { app } from "./app";
 import { getSupabase } from "./supabase";
+import { loadRoutingRules } from "./routing";
 import { processPendingBatch } from "./deliveryWorker";
 import { defaultDeliveryLimiter } from "./rateLimit";
 
@@ -30,6 +31,8 @@ export interface WorkerHandle {
 // rather than leaving a half-started gateway whose tunnel points at nothing.
 export function startServer(port: number): Promise<ServerHandle> {
   return new Promise((resolve, reject) => {
+    // Fail before binding: a malformed routing config must not serve traffic.
+    try { loadRoutingRules(); } catch (err) { reject(err); return; }
     const server: Server = app.listen(port);
 
     const onError = (err: Error) => {
