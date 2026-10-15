@@ -107,7 +107,14 @@ export async function runStart(
   deps: CliDeps
 ): Promise<GatewayHandle> {
   const server = await deps.startServer(options.port);
-  const worker = deps.startWorker(options.pollInterval);
+  let worker: WorkerHandle;
+  try {
+    worker = deps.startWorker(options.pollInterval);
+  } catch (err) {
+    // Invalid worker configuration must not leave the HTTP server running.
+    await server.close();
+    throw err;
+  }
 
   let tunnel: TunnelHandle | null = null;
   if (options.tunnel) {
