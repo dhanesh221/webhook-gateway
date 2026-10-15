@@ -96,6 +96,23 @@ WG_SOURCE_PAYMENTS_SECRET=your-high-entropy-source-secret
 
 Signing secret example generation: `openssl rand -hex 32`. Keep the generated value private and share it only through your sender's secure configuration path. Source secrets, the service-role key and session secret require secure collection, never chat.
 
+## Deploy settings
+
+Set `NODE_ENV=production` and serve the gateway over HTTPS so session cookies are Secure. Express currently leaves `trust proxy` off. If deployment has exactly one trusted reverse proxy in front, set `app.set("trust proxy", 1)` after creating the app in `src/app.ts`. Verify the actual proxy path with the host; do not assume every Render/Fly setup has one hop. Leave it off for direct access. Multiple proxies need a separately reviewed configuration.
+
+A wrong `trust proxy` setting can let callers spoof their client address through forwarded headers and bypass the per-address login throttle, even with a patched `proxy-addr`. Do not enable it blindly or allow a shorter route around the trusted proxy.
+
+Build with dev dependencies, then omit them from the runtime install:
+
+```bash
+npm ci
+npm run build
+npm ci --omit=dev
+NODE_ENV=production npm start
+```
+
+Localtunnel is dev-only and loaded only when requested. The compiled CLI can run without it: `node dist/cli.js start --no-tunnel`. Helmet adds security headers; dashboard scripts are same-origin files so the content security policy does not allow inline scripts.
+
 ## Running and tests
 
 Node 22 or newer is recommended (locked dependencies include Commander 15).
@@ -150,7 +167,7 @@ Tests use fake Supabase RPC storage and real local HTTP receivers. They cover ro
 
 ### Dependency audit at Phase A review
 
-`npm audit --omit=dev` reported five pre-existing runtime vulnerabilities (three moderate, two high), involving localtunnel's axios and `qs` through Express/body-parser. No forced downgrade was applied. Treat localtunnel as development-only; resolve the dependency audit before public deployment. Phase A adds no runtime dependencies.
+The dependency patch updates Express/body-parser, `proxy-addr` and `qs` within their existing ranges. `npm audit --omit=dev` reports no runtime findings with the updated lockfile. The full audit still reports development-only localtunnel/axios and Vitest toolchain findings; npm proposes breaking changes for those, which were not applied. Re-run the audit before deployment because advisories change.
 
 ## Delivery safety (migration 009)
 
