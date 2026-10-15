@@ -291,3 +291,14 @@ describe("formatStartupBanner", () => {
     expect(banner).toContain("http://localhost:4100/dashboard.html");
   });
 });
+
+
+describe("worker startup failure", () => {
+  it("closes the server if invalid worker config prevents startup", async () => {
+    const rec = makeDeps({ startWorker: () => { throw new Error("Invalid delivery rate"); } });
+    await expect(runStart({ port: 3000, tunnel: false, pollInterval: 2000 }, rec.deps)).rejects.toThrow("Invalid delivery rate");
+    expect(rec.serverClose).toHaveBeenCalledTimes(1);
+    expect(rec.deps.openTunnel).not.toHaveBeenCalled();
+    expect(rec.registered).toHaveLength(0);
+  });
+});
