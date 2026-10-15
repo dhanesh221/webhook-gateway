@@ -12,6 +12,48 @@ Delivery is **at least once**, not exactly once. If the destination accepts an e
 
 Circuit breakers are shared by destination URL: five consecutive failures open a breaker for 60 seconds, then a delivery probes it. Breaker skips do not consume event attempts. Sources using the same URL share a breaker.
 
+## Process metrics
+
+`GET /metrics` returns Prometheus text exposition version 0.0.4. It is private: use a valid dashboard session cookie or a separate `Authorization: Bearer <token>` header. Set `WG_METRICS_TOKEN` to a high-entropy secret of at least 32 non-padding characters, up to 4096 characters. Generate one with `openssl rand -hex 32` and keep it in secure server configuration. An unset, short or blank token disables bearer access, not the dashboard-session route. Tokens in query strings are never accepted. Serve scrapes over HTTPS in production; restrict scrape traffic at the reverse proxy.
+
+Bearer scrapes work without querying Supabase. Dashboard-cookie access still checks the revocable session in Supabase and fails closed if that check fails. Responses use `Cache-Control: no-store`. Changing the configured token invalidates the old token; environment-file changes require restarting the process. Dashboard session revocation does not revoke the separate scrape token.
+
+Example Prometheus scrape configuration (the credentials file contains only the token, and must be readable only by the monitoring service):
+
+```yaml
+scrape_configs:
+  - job_name: webhook-gateway
+    scheme: https
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials_file: /run/secrets/wg_metrics_token
+    static_configs:
+      - targets: ['gateway.example:443']
+```
+
+For a local manual scrape, load the token into `WG_METRICS_TOKEN` securely, then send the header via stdin rather than placing the token in curl's command-line arguments:
+
+```bash
+printf 'header = "Authorization: Bearer %s"\n' "$WG_METRICS_TOKEN" | curl --config - http://127.0.0.1:3000/metrics
+```
+
+| Counter | Counts |
+| --- | --- |
+| `webhook_events_received_total` | Newly stored events. Duplicate acknowledgements, rejected signatures/bodies and failed inserts do not count. |
+| `webhook_events_delivered_total` | Delivery attempts returning HTTP success. Counts even if later DB accounting fails. It is not a count of unique delivered events or proof that the DB status is delivered. |
+| `webhook_events_failed_total` | Failed delivery attempts, including network exceptions and missing destinations. The final failure also counts here. |
+| `webhook_events_retried_total` | Failed events whose retry-scheduling RPC returned without an error before attempt five. This counts acknowledged schedules, not the later retry attempt itself. |
+| `webhook_events_dead_lettered_total` | Failed events whose retry/DLQ RPC returned without an error at attempt five or later. |
+
+Retry/DLQ metrics depend on the existing RPC contract. No live database readback is added. A thrown or returned DB error does not increment them. Breaker skips, rate-limit deferrals, failed claims and raw-body releases do not count as delivery attempts. Replays do not increment received; subsequent attempts increment delivered/failed normally. At-least-once redelivery can increase attempt counters more than once for the same event.
+
+Each total has a separate `webhook_events_<kind>_by_route_total` family with `source_id` and `destination_id` labels. These are SHA-256 hex digests of the exact source and destination URL, not raw text. Payloads, headers, IDs, URL credentials, query tokens and error messages are never exported. Hashes are pseudonyms, not encryption: someone with candidate values can hash them and correlate the labels. Authentication is still required. Different URL paths, trailing slashes and query strings get different IDs. `missing` represents a null destination; strings longer than 4096 UTF-16 code units are grouped as `oversized`.
+
+The process retains at most 1000 named source/destination pairs across all counters. Further new pairs go to `source_id="overflow",destination_id="overflow"`; existing pairs keep updating. No pairs are evicted until restart, preserving counter monotonicity. Detailed families sum to the corresponding totals, including overflow. Do not sum a total and its detailed family together. At the cap there are 5010 samples and roughly 1 MB of text per scrape. Apply a sensible scrape interval and protect against abusive scrape traffic; this is not an unbounded public endpoint.
+
+Counts live only in memory, start at zero and reset on process restart. They are not persisted historical totals or "today" counts. Use `npm run gateway -- start` to keep ingest and the worker in the same process. A separately running `npm run worker` keeps its own delivery counters, which the ingest server's `/metrics` cannot expose; this change does not add a standalone-worker scrape server or shared aggregation. Prometheus must handle process resets and instance labels. Internal integers remain exact beyond 2^53, but Prometheus stores floating-point values and cannot retain every unit at that scale. Impossible increments beyond 10^100 are rejected before changing any counter. No database migration or monitoring service installation is needed.
+
 ## Phase A changes
 
 ### Registered sources and routing
