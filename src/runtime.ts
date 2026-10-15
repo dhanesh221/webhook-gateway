@@ -12,6 +12,7 @@ import type { Server } from "node:http";
 import { app } from "./app";
 import { getSupabase } from "./supabase";
 import { processPendingBatch } from "./deliveryWorker";
+import { defaultDeliveryLimiter } from "./rateLimit";
 
 export const DEFAULT_PORT = 3000;
 export const DEFAULT_POLL_INTERVAL_MS = 2000;
@@ -58,13 +59,15 @@ export function startServer(port: number): Promise<ServerHandle> {
 // in-flight poll so shutdown doesn't cut a delivery attempt off between "HTTP
 // request sent" and "outcome recorded in the database".
 export function startWorker(intervalMs: number = DEFAULT_POLL_INTERVAL_MS): WorkerHandle {
+  // Validate configuration before starting any poll or claiming database rows.
+  const limiter = defaultDeliveryLimiter();
   let stopped = false;
   let timer: NodeJS.Timeout | undefined;
 
   async function tick(): Promise<void> {
     if (stopped) return;
     try {
-      await processPendingBatch(getSupabase());
+      await processPendingBatch(getSupabase(), undefined, limiter);
     } catch (err) {
       console.error(`[worker] unexpected error during poll: ${(err as Error).message}`);
     }
