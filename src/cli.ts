@@ -25,6 +25,8 @@ import {
 } from "./runtime";
 import { openTunnel, type TunnelHandle } from "./tunnel";
 import { list as dlqList, replay as dlqReplay } from "./dlq";
+import { runRetention, describeRetention, retentionPolicyFromEnv, type RetentionPolicy, type RetentionResult } from "./retention";
+import { getSupabase } from "./supabase";
 
 export interface CliDeps {
   startServer(port: number): Promise<ServerHandle>;
@@ -36,6 +38,7 @@ export interface CliDeps {
   listSources?: typeof listSources;
   disableSource?: typeof disableSource;
   revokeAllSessions?: typeof revokeAllSessions;
+  runRetention?: (policy: RetentionPolicy) => Promise<RetentionResult>;
   log(message: string): void;
   error(message: string): void;
   /**
@@ -51,6 +54,7 @@ export const realDeps: CliDeps = {
   startWorker,
   openTunnel,
   saveSource, listSources, disableSource, revokeAllSessions,
+  runRetention: (policy) => runRetention(getSupabase(), policy),
   dlqList: () => dlqList(),
   dlqReplay: (id) => dlqReplay(id),
   log: (message) => console.log(message),
@@ -163,6 +167,14 @@ export async function runStart(
   };
 }
 
+function parseNonNegativeNumber(label: string, value: string): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw new CommanderError(1, "gateway.invalidArgument", `${label} must be a number >= 0`);
+  }
+  return parsed;
+}
+
 function parsePositiveInt(label: string, value: string): number {
   const parsed = Number(value);
   if (!Number.isInteger(parsed) || parsed <= 0) {
@@ -246,6 +258,21 @@ export function buildProgram(deps: CliDeps): Command {
     await (deps.disableSource ?? disableSource)(name);
     deps.log(`Source ${name} disabled for new ingest; queued events are unchanged.`);
   });
+  const retention = program.command("retention").description("Purge finished events past their retention age");
+  retention.command("purge")
+    .description("Delete delivered/dead-lettered events older than the policy, and stale sessions (needs migration 012)")
+    .option("--delivered-days <days>", "keep delivered events this many days; 0 keeps forever",
+      (v) => parseNonNegativeNumber("--delivered-days", v))
+    .option("--dead-lettered-days <days>", "keep dead-lettered events this many days; 0 keeps forever",
+      (v) => parseNonNegativeNumber("--dead-lettered-days", v))
+    .action(async (options: { deliveredDays?: number; deadLetteredDays?: number }) => {
+      const policy = { ...retentionPolicyFromEnv() };
+      if (options.deliveredDays !== undefined) policy.deliveredDays = options.deliveredDays;
+      if (options.deadLetteredDays !== undefined) policy.deadLetteredDays = options.deadLetteredDays;
+      const run = deps.runRetention ?? ((p: RetentionPolicy) => runRetention(getSupabase(), p));
+      deps.log(describeRetention(policy, await run(policy)));
+    });
+
   program.command("sessions-revoke-all").description("Revoke every dashboard session")
     .action(async () => { await (deps.revokeAllSessions ?? revokeAllSessions)(); deps.log("Dashboard sessions revoked."); });
 
