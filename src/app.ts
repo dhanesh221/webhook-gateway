@@ -107,6 +107,23 @@ app.get("/health", asyncRoute(async (_req, res) => {
   }
 }));
 
+// Readiness for load balancers and orchestrators: can this process reach the
+// database with its service-role credentials? A cheap RPC that always exists
+// after 008 and touches one indexed row at most. 503 keeps traffic away from a
+// replica whose credentials or network are wrong; /health stays liveness-only.
+app.get("/ready", async (_req, res) => {
+  try {
+    const { error } = await getSupabase().rpc("is_dashboard_session_active", {
+      p_id: "00000000-0000-0000-0000-000000000000",
+    });
+    if (error) throw new Error(error.message);
+    res.json({ status: "ready" });
+  } catch (err) {
+    console.error(`[ready] database check failed: ${(err as Error).message}`);
+    res.status(503).json({ status: "not_ready" });
+  }
+});
+
 // Receives a webhook from an external provider and stores it for later delivery.
 // Responds immediately — actual delivery is the Phase 3 worker's job.
 app.post("/webhooks/:source", asyncRoute(async (req, res) => {

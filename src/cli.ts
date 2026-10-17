@@ -78,8 +78,22 @@ export interface GatewayHandle {
 // Pure: takes the facts, returns the lines. Kept separate from runStart so the
 // exact operator-facing wording can be asserted in a test without starting
 // anything.
-export function formatStartupBanner(port: number, publicUrl: string | null): string[] {
+export function formatStartupBanner(
+  port: number,
+  publicUrl: string | null,
+  production: boolean = process.env.NODE_ENV === "production"
+): string[] {
   const lines: string[] = [];
+
+  if (production && !publicUrl) {
+    lines.push(`Your gateway is listening on port ${port} (NODE_ENV=production).`);
+    lines.push("Expose it only through your HTTPS reverse proxy; see README, Deployment.");
+    lines.push("");
+    lines.push("Dashboard: /dashboard.html on your public domain. Credentials come from the environment.");
+    lines.push("");
+    lines.push("Delivery worker is running in this same process. SIGTERM stops both.");
+    return lines;
+  }
 
   if (publicUrl) {
     lines.push(`Your gateway is live at: ${publicUrl}`);
@@ -213,10 +227,17 @@ export function buildProgram(deps: CliDeps): Command {
       DEFAULT_POLL_INTERVAL_MS
     )
     .action(async (options: { port: number; tunnel: boolean; pollInterval: number }) => {
+      // localtunnel is a development convenience and a devDependency; a
+      // production install does not have it and must not try to use it.
+      let tunnel = options.tunnel;
+      if (tunnel && process.env.NODE_ENV === "production") {
+        tunnel = false;
+        deps.log("NODE_ENV=production: not opening a development tunnel. Serve behind your own HTTPS reverse proxy.");
+      }
       const handle = await runStart(
         {
           port: options.port,
-          tunnel: options.tunnel,
+          tunnel,
           pollInterval: options.pollInterval,
         },
         deps

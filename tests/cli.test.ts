@@ -134,6 +134,29 @@ describe("gateway start — routing", () => {
     expect(rec.deps.startWorker).toHaveBeenCalledWith(500);
   });
 
+  it("prints a production banner that does not mention tunnels or .env.local", () => {
+    const lines = formatStartupBanner(3000, null, true);
+    expect(lines[0]).toContain("NODE_ENV=production");
+    expect(lines.join("\n")).not.toMatch(/tunnel|\.env\.local/);
+    expect(lines.join("\n")).toContain("HTTPS reverse proxy");
+    // A public URL (dev tunnel) still wins even if the flag were set.
+    expect(formatStartupBanner(3000, "https://x.loca.lt", true)[0]).toContain("https://x.loca.lt");
+  });
+
+  it("never opens a tunnel when NODE_ENV=production, even without --no-tunnel", async () => {
+    vi.stubEnv("NODE_ENV", "production");
+    try {
+      await run(rec.deps, ["start"]);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+    expect(rec.deps.startServer).toHaveBeenCalledTimes(1);
+    expect(rec.deps.startWorker).toHaveBeenCalledTimes(1);
+    expect(rec.deps.openTunnel).not.toHaveBeenCalled();
+    expect(rec.logs.join("\n")).toContain("NODE_ENV=production: not opening a development tunnel");
+    expect(rec.logs.join("\n")).toContain("HTTPS reverse proxy");
+  });
+
   it("skips the tunnel entirely with --no-tunnel", async () => {
     await run(rec.deps, ["start", "--no-tunnel"]);
 

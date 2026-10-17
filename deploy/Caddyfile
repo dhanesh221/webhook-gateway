@@ -1,0 +1,17 @@
+{$GATEWAY_DOMAIN} {
+	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options nosniff
+		Referrer-Policy no-referrer
+		-Server
+	}
+	# Webhook bodies are capped at 1 MB by the gateway; stop larger ones here too.
+	request_body {
+		max_size 2MB
+	}
+	reverse_proxy gateway:3000 {
+		health_uri /ready
+		health_interval 15s
+	}
+}

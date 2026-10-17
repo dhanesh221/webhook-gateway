@@ -195,6 +195,23 @@ NODE_ENV=production npm start
 
 Localtunnel is dev-only and loaded only when requested. The compiled CLI can run without it: `node dist/cli.js start --no-tunnel`. Helmet adds security headers; dashboard scripts are same-origin files so the content security policy does not allow inline scripts.
 
+### Docker image and Caddy HTTPS stack
+
+`deploy/` holds a working single-host setup behind Caddy:
+
+```bash
+cp deploy/env.example deploy/.env      # fill in; deploy/.env is gitignored
+cd deploy && docker compose up -d --build
+```
+
+- `Dockerfile`: multi-stage, compiled TypeScript, `npm ci --omit=dev` (no development tunnel), runs as `node`, `HEALTHCHECK` on `/health`, `CMD node dist/cli.js start --no-tunnel`. Nothing from `.env.local` is copied in; the `.dockerignore` excludes it.
+- `deploy/docker-compose.yml` + `deploy/Caddyfile`: Caddy obtains and renews a Let's Encrypt certificate for `GATEWAY_DOMAIN`, adds HSTS and `nosniff`, caps request bodies at 2 MB, health-checks the gateway on `/health`, and is the only published port. The gateway runs with `NODE_ENV=production`, `PORT=3000`, `TRUST_PROXY=1` (Caddy is the one trusted hop, so `req.ip` is the real client), and `stop_grace_period: 30s` so in-flight deliveries finish on SIGTERM.
+- `NODE_ENV=production` also makes `start` refuse to open a development tunnel, marks cookies `Secure`, and rejects loopback HTTP destinations.
+
+Secrets: the service-role key, source secrets, `ADMIN_PASSWORD_HASH`, `SESSION_SECRET` and `METRICS_TOKEN` live only in the environment of the gateway process (here, `deploy/.env` on the host). They are never written to `public/`, never logged (ingest logs the rejection reason, not the header; the worker logs event ids, not payloads), and never returned in HTTP responses. Point the gateway at a Supabase project that holds nothing else, because the service-role key bypasses RLS on everything in that project.
+
+Any other host works the same way: build the image, provide the environment, put an HTTPS proxy in front that forwards `X-Forwarded-For`, set `TRUST_PROXY` to match the number of trusted hops (or the proxy's CIDR), and probe `/health`. For several gateway instances, read the note under "Remaining work".
+
 ## Running and tests
 
 Node 22 or newer is recommended (locked dependencies include Commander 15).
@@ -250,8 +267,8 @@ Refill uses a monotonic clock. Open circuit breakers defer without spending toke
 
 - Confirm the reconstructed `migrations/000_base_schema.sql` against the live project: run `migrations/inspect_live_schema.sql`, diff the function bodies, correct 000 where they differ, then run `npm run verify:db` to check RPC presence and that anon is locked out.
 - Polls within one worker do not overlap, and open-breaker probes are leased across workers (010), so multiple worker processes can run; claims use the database's row locking.
-- Add a distinct outbound secret per destination, destination controls appropriate for any multi-tenant use and stable HTTPS hosting. Ingest and login limits are in-process; a shared limiter at the proxy is still needed for multi-instance deployments.
-- Keep secrets separate from browser assets and logs. Service-role access has broad privileges; scope operational access to this dedicated gateway database.
+- Add a distinct outbound secret per destination and destination controls appropriate for any multi-tenant use. The Docker image and Caddy stack under `deploy/` give one HTTPS instance; multi-instance deployments need a shared rate limiter at the proxy (ingest and login limits are in-process) and per-process metrics scraping.
+- Service-role access has broad privileges; keep the gateway in its own Supabase project so that key reaches nothing else.
 
 ## Phases
 
