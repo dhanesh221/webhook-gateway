@@ -2,7 +2,7 @@ import { TokenBuckets } from "../src/rateLimit";
 import { describe, it, expect, afterEach, vi } from "vitest";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
-import { processPendingBatch } from "../src/deliveryWorker";
+import { processPendingBatch, PROBE_LEASE_SECONDS, type DeliverFn } from "../src/deliveryWorker";
 import { makeFakeSupabase } from "./fakeSupabase";
 
 describe("circuit breaker", () => {
@@ -142,5 +142,89 @@ describe("circuit breaker", () => {
     });
     outcomes = await processPendingBatch(client, undefined, new TokenBuckets({ rps: 10000, burst: 10000 }));
     expect(outcomes.find((o) => o.id === "resumed-event")?.outcome).toBe("delivered");
+  });
+
+  // Trips a breaker for `url` using an injected deliver, without a real server.
+  async function tripBreaker(client: ReturnType<typeof makeFakeSupabase>["client"], url: string) {
+    const failing: DeliverFn = async () => ({ ok: false, status: 500 });
+    for (let i = 0; i < 5; i++) await processPendingBatch(client, failing);
+  }
+
+  const row = (id: string, destination_url: string) =>
+    ({ id, source: "test", attempts: 0, payload: {}, destination_url, status: "pending" });
+
+  it("lets exactly one of several concurrent workers probe a due breaker", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const url = "https://recovering.invalid/hook";
+    const COOLDOWN_MS = 5_000;
+    const { client, table, breakers } = makeFakeSupabase(
+      Array.from({ length: 5 }, (_, i) => ({ id: `fail-${i}`, source: "test", attempts: 0, payload: {}, destination_url: url })),
+      { cooldownMs: COOLDOWN_MS, claimLimit: 1 }
+    );
+    // claimLimit 1 means each poll claims one row; drain the five failing rows.
+    const failing: DeliverFn = async () => ({ ok: false, status: 500 });
+    for (let i = 0; i < 5; i++) await processPendingBatch(client, failing);
+    expect(breakers.get(url)?.state).toBe("open");
+    for (const r of table.values()) r.status = "delivered"; // out of the way
+
+    vi.setSystemTime(new Date(Date.now() + COOLDOWN_MS + 1000));
+    table.set("a", row("a", url));
+    table.set("b", row("b", url));
+
+    // Both "workers" poll at the same instant. The probe hangs until released so
+    // the second worker decides while the first probe is still in flight.
+    let release!: (r: { ok: boolean; status: number }) => void;
+    const gate = new Promise<{ ok: boolean; status: number }>((res) => (release = res));
+    const calls: string[] = [];
+    const slowDeliver: DeliverFn = async (u) => { calls.push(u); return gate; };
+
+    const batches = Promise.all([processPendingBatch(client, slowDeliver), processPendingBatch(client, slowDeliver)]);
+    await vi.waitFor(() => expect(calls).toHaveLength(1));
+    // Lease taken: the breaker's probe time moved out by the lease length.
+    const leaseEnd = Date.parse(breakers.get(url)!.nextProbeAt!);
+    expect(leaseEnd).toBeGreaterThan(Date.now());
+    expect(leaseEnd).toBeLessThanOrEqual(Date.now() + PROBE_LEASE_SECONDS * 1000);
+
+    release({ ok: true, status: 200 });
+    const [first, second] = await batches;
+    const all = [...first, ...second];
+    expect(calls).toHaveLength(1);                       // one probe, not two
+    expect(all.map((o) => o.outcome).sort()).toEqual(["delivered", "skipped"]);
+    const skipped = all.find((o) => o.outcome === "skipped")!;
+    expect(table.get(skipped.id)!.status).toBe("pending");
+    expect(table.get(skipped.id)!.attempts).toBe(0);     // waiting costs nothing
+    expect(breakers.get(url)?.state).toBe("closed");     // the one probe closed it
+  });
+
+  it("still probes, unleased, when the lease RPC is missing (pre-010 database)", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const url = "https://legacy.invalid/hook";
+    const COOLDOWN_MS = 5_000;
+    const fake = makeFakeSupabase(
+      Array.from({ length: 5 }, (_, i) => ({ id: `fail-${i}`, source: "test", attempts: 0, payload: {}, destination_url: url })),
+      { cooldownMs: COOLDOWN_MS }
+    );
+    const realRpc = (fake.client as unknown as { rpc: (fn: string, args?: unknown) => Promise<unknown> }).rpc;
+    (fake.client as unknown as { rpc: unknown }).rpc = async (fn: string, args?: unknown) =>
+      fn === "claim_circuit_probe"
+        ? { data: null, error: { code: "PGRST202", message: "Could not find the function" } }
+        : realRpc(fn, args);
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await tripBreaker(fake.client, url);
+    expect(fake.breakers.get(url)?.state).toBe("open");
+    for (const r of fake.table.values()) r.status = "delivered"; // out of the way
+    vi.setSystemTime(new Date(Date.now() + COOLDOWN_MS + 1000));
+    fake.table.set("probe", row("probe", url));
+
+    const calls: string[] = [];
+    const ok: DeliverFn = async (u) => { calls.push(u); return { ok: true, status: 200 }; };
+    const outcomes = await processPendingBatch(fake.client, ok);
+
+    expect(outcomes.find((o) => o.id === "probe")?.outcome).toBe("delivered");
+    expect(calls).toEqual([url]);
+    expect(fake.breakers.get(url)?.state).toBe("closed");
+    expect(errors.mock.calls.some(([m]) => String(m).includes("Apply migrations/010"))).toBe(true);
+    errors.mockRestore();
   });
 });

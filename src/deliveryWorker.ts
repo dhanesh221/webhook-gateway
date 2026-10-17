@@ -25,6 +25,11 @@ export const STALE_CLAIM_SECONDS = 10 * 60;
 
 const DELIVERY_TIMEOUT_MS = 10_000;
 
+// How long one worker holds the exclusive right to probe an open breaker. Must
+// cover a full delivery attempt (DELIVERY_TIMEOUT_MS) plus recording its result;
+// if the prober dies, the lease lapses and the next due poll takes over.
+export const PROBE_LEASE_SECONDS = 30;
+
 // Real HTTP delivery. Injectable so tests can point it at a local server, or
 // (for the backoff-only cases) skip real network calls entirely.
 const defaultDeliver: DeliverFn = async (url, payload, rawBody) => {
@@ -162,25 +167,15 @@ async function processRow(
         !breaker.next_probe_at || Date.parse(breaker.next_probe_at) <= Date.now();
 
       if (!probeDue) {
-        const { error: skipError } = await supabase.rpc("mark_webhook_event_skipped", {
-          p_id: row.id,
-          p_next_attempt_at: breaker.next_probe_at,
-        });
-        if (skipError) {
-          console.error(`[worker] event ${row.id}: failed to mark skipped (${skipError.message})`);
-        }
-        console.log(
-          `[worker] circuit open for ${row.destination_url}, skipping event ${row.id} until ${breaker.next_probe_at}`
-        );
-        results.push({ id: row.id, outcome: "skipped", attempt: row.attempts });
+        results.push(await skipUntil(supabase, row, breaker.next_probe_at, "circuit open"));
         return;
       }
 
-      console.log(
-        `[worker] circuit open for ${row.destination_url} but cooldown elapsed, attempting probe delivery for event ${row.id}`
-      );
     }
 
+    // The delivery token is taken before any probe lease: an empty bucket must
+    // defer the event without consuming the lease, or nobody would probe until
+    // the lease lapsed.
     const waitMs = limiter.take(row.destination_url);
     if (waitMs > 0) {
       const { error } = await supabase.rpc("mark_webhook_event_skipped", {
@@ -190,6 +185,24 @@ async function processRow(
       if (error) throw new Error("Failed to defer rate-limited event");
       results.push({ id: row.id, outcome: "rate_limited", attempt: row.attempts });
       return;
+    }
+
+    if (breaker.state === "open") {
+      // Every worker polling right now sees the same due probe. Only the one that
+      // wins the lease sends it; the rest wait for the lease (or the probe's own
+      // outcome) rather than piling onto a destination that is still recovering.
+      const lease = await claimProbe(supabase, row.destination_url);
+      if (lease === "taken") {
+        const current = await getCircuitBreakerState(supabase, row.destination_url);
+        const until =
+          current.next_probe_at ?? new Date(Date.now() + PROBE_LEASE_SECONDS * 1000).toISOString();
+        results.push(await skipUntil(supabase, row, until, "probe already in flight elsewhere"));
+        return;
+      }
+
+      console.log(
+        `[worker] circuit open for ${row.destination_url} but cooldown elapsed, attempting probe delivery for event ${row.id}`
+      );
     }
 
     let result: DeliverResult;
@@ -237,6 +250,53 @@ async function processRow(
         );
       }
     }
+}
+
+// Returns a claimed row to pending without spending an attempt, due again at
+// `until`. Used for breaker skips of both kinds.
+async function skipUntil(
+  supabase: SupabaseClient,
+  row: ClaimedWebhookEvent,
+  until: string | null,
+  reason: string
+): Promise<BatchOutcome> {
+  const { error } = await supabase.rpc("mark_webhook_event_skipped", {
+    p_id: row.id,
+    p_next_attempt_at: until,
+  });
+  if (error) {
+    console.error(`[worker] event ${row.id}: failed to mark skipped (${error.message})`);
+  }
+  console.log(`[worker] ${reason} for ${row.destination_url}, skipping event ${row.id} until ${until}`);
+  return { id: row.id, outcome: "skipped", attempt: row.attempts };
+}
+
+let probeLeaseUnavailableLogged = false;
+
+// Atomically takes the right to probe an open breaker (migration 010). "won"
+// means probe now; "taken" means another worker got there first; "unavailable"
+// means the RPC is missing or failed, in which case the caller probes anyway,
+// exactly as every worker did before 010.
+async function claimProbe(
+  supabase: SupabaseClient,
+  destinationUrl: string
+): Promise<"won" | "taken" | "unavailable"> {
+  try {
+    const { data, error } = await supabase.rpc("claim_circuit_probe", {
+      p_destination_url: destinationUrl,
+      p_lease_seconds: PROBE_LEASE_SECONDS,
+    });
+    if (error) throw new Error(error.message);
+    return data === true ? "won" : "taken";
+  } catch (err) {
+    if (!probeLeaseUnavailableLogged) {
+      probeLeaseUnavailableLogged = true;
+      console.error(
+        `[worker] probe lease unavailable (${(err as Error).message}); probing without one. Apply migrations/010`
+      );
+    }
+    return "unavailable";
+  }
 }
 
 // The claim RPC's column list lives in the database, so raw_body is read with a
