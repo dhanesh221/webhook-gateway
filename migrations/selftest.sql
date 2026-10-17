@@ -141,6 +141,21 @@ begin
   perform public.upsert_webhook_source('payments', 'https://example.invalid/p', 'WG_SOURCE_PAYMENTS_SECRET');
   select count(*) into n from public.get_webhook_source('payments');
   if n <> 1 then raise exception 'source not found'; end if;
+  -- 011: scheme defaults to gateway, can be set, unknown values rejected.
+  select signature_scheme into r from public.get_webhook_source('payments');
+  if r.signature_scheme <> 'gateway' then raise exception 'default scheme wrong: %', r; end if;
+  perform public.upsert_webhook_source('gh', 'https://example.invalid/gh', 'WG_SOURCE_GH_SECRET', 'github');
+  select signature_scheme into r from public.get_webhook_source('gh');
+  if r.signature_scheme <> 'github' then raise exception 'github scheme not stored: %', r; end if;
+  begin
+    perform public.upsert_webhook_source('bad', 'https://example.invalid/b', 'WG_SOURCE_BAD_SECRET', 'paypal');
+    raise exception 'unknown scheme accepted';
+  exception when check_violation then null; end;
+  -- 010: a due probe is claimable exactly once.
+  perform public.record_delivery_failure('https://probe.invalid/');
+  update public.circuit_breakers set state = 'open', next_probe_at = now() - interval '1 second' where destination_url = 'https://probe.invalid/';
+  if not public.claim_circuit_probe('https://probe.invalid/', 30) then raise exception 'due probe not claimable'; end if;
+  if public.claim_circuit_probe('https://probe.invalid/', 30) then raise exception 'probe claimed twice'; end if;
   if not public.disable_webhook_source('payments') then raise exception 'disable returned false'; end if;
   if public.disable_webhook_source('nope') then raise exception 'disable of unknown returned true'; end if;
   select enabled into r from public.get_webhook_source('payments');

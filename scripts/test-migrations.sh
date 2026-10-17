@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Applies migrations 000 -> 008 -> 009 to a throwaway Postgres in Docker, applies
+# Applies every numbered migration to a throwaway Postgres in Docker, applies
 # them a second time to prove they are repeatable, then runs migrations/selftest.sql,
 # which drives every RPC the way the application does and checks privileges.
 #
@@ -30,15 +30,16 @@ psqlx() { docker exec -i "$NAME" psql -v ON_ERROR_STOP=1 -X -q -U postgres -d ga
 # Supabase ships these roles; a plain Postgres does not.
 psqlx -c "create role anon nologin; create role authenticated nologin; create role service_role nologin;"
 
-for m in 000 008 009; do
-  f=$(ls migrations/${m}_*.sql)
+# Every numbered migration, in order (000 base, then 008 onward).
+MIGRATIONS=$(ls migrations/[0-9][0-9][0-9]_*.sql | sort)
+for f in $MIGRATIONS; do
   psqlx < "$f"
   echo "applied   $f"
 done
-for m in 000 008 009; do
-  psqlx < "$(ls migrations/${m}_*.sql)"
+for f in $MIGRATIONS; do
+  psqlx < "$f"
 done
-echo "re-applied 000, 008, 009: repeatable"
+echo "re-applied all: repeatable"
 
 psqlx < migrations/selftest.sql 2>&1 | sed 's/^psql:.*NOTICE:  //'
 echo "migrations self-test passed"
