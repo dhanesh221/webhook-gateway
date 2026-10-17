@@ -92,7 +92,7 @@ describe("raw body delivery", () => {
     const f = makeFakeSupabase([{ id: "old", source: "s", attempts: 0, payload: { x: 1 }, destination_url: "https://d.example/h" }]);
     const deliver = vi.fn(async () => ({ ok: true }));
     await processPendingBatch(f.client, deliver);
-    expect(deliver).toHaveBeenCalledWith("https://d.example/h", { x: 1 }, null);
+    expect(deliver).toHaveBeenCalledWith("https://d.example/h", { x: 1 }, null, expect.objectContaining({ "X-Webhook-Event-Id": "old" }));
   });
   it("does not follow redirects", async () => {
     let hits = 0;
