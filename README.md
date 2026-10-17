@@ -10,7 +10,7 @@ Ingest returns `202` after an event is stored. An optional `Idempotency-Key` ded
 
 Delivery is **at least once**, not exactly once. If the destination accepts an event but the gateway fails before recording success, a retry may repeat the side effect. Downstream applications must implement their own deduplication. An `in_progress` event abandoned by a crashed worker is returned to `pending` after ten minutes (migration 009) without using an attempt, so it may be delivered again.
 
-Circuit breakers are shared by destination URL: five consecutive failures open a breaker for 60 seconds, then a delivery probes it. Breaker skips do not consume event attempts. Sources using the same URL share a breaker.
+Circuit breakers are shared by destination URL: five consecutive failures open a breaker for 60 seconds, then a single delivery probes it. The probe is leased (migration 010): the worker that wins the lease sends it, and any other worker that sees the same due breaker waits for the lease (30 seconds) or the probe's outcome, so a recovering destination gets one request however many workers run. Without migration 010 every worker probes, as before. Breaker skips do not consume event attempts. Sources using the same URL share a breaker.
 
 ## Process metrics
 
@@ -209,7 +209,7 @@ Refill uses a monotonic clock. Open circuit breakers defer without spending toke
 ## Remaining work before a public service
 
 - Confirm the reconstructed `migrations/000_base_schema.sql` against the live project: run `migrations/inspect_live_schema.sql`, diff the function bodies, correct 000 where they differ, then run `npm run verify:db` to check RPC presence and that anon is locked out.
-- Add abandoned-claim recovery/leases, stable event IDs in downstream delivery and downstream idempotency. Polls within one worker no longer overlap; investigate circuit-breaker probe concurrency across multiple worker processes before scaling workers.
+- Add stable event IDs in downstream delivery and downstream idempotency. Polls within one worker do not overlap, and open-breaker probes are leased across workers (010), so multiple worker processes can run; claims use the database's row locking.
 - Add provider-native signature adapters and outbound signing, destination controls appropriate for any multi-tenant use, stronger identity/rate limiting, retention, metrics and stable HTTPS hosting.
 - Keep secrets separate from browser assets and logs. Service-role access has broad privileges; scope operational access to this dedicated gateway database.
 
@@ -230,7 +230,7 @@ The dependency patch updates Express/body-parser, `proxy-addr` and `qs` within t
 
 ## Delivery safety (migration 009)
 
-Apply `migrations/009_crash_safety_raw_body.sql` before running this version; ingest writes the new `raw_body` column and fails without it.
+Apply `migrations/009_crash_safety_raw_body.sql` before running this version; ingest writes the new `raw_body` column and fails without it. Then apply `migrations/010_circuit_probe_lease.sql`; without it the worker logs once and probes open breakers unleased.
 
 - Events are delivered as the exact bytes received, so integers above 2^53 and the sender's formatting arrive intact. Rows with an explicit NULL raw body (stored before the migration) fall back to the parsed payload. A failed raw-body read releases the batch for retry without spending delivery attempts; a missing or unreadable row is released too. No parsed-payload fallback is used on a read failure.
 - A failure while handling one claimed event releases that event to `pending` instead of leaving it, and the rest of the batch, in `in_progress`.

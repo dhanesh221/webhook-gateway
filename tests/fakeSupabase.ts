@@ -41,7 +41,7 @@ interface FakeBreaker {
 
 export function makeFakeSupabase(
   rows: ClaimedWebhookEvent[],
-  opts: { failureThreshold?: number; cooldownMs?: number; claimAgeMs?: number } = {}
+  opts: { failureThreshold?: number; cooldownMs?: number; claimAgeMs?: number; claimLimit?: number } = {}
 ) {
   const failureThreshold = opts.failureThreshold ?? 5;
   const cooldownMs = opts.cooldownMs ?? 60_000;
@@ -144,6 +144,9 @@ export function makeFakeSupabase(
         case "claim_pending_webhook_events": {
           const claimed: ClaimedWebhookEvent[] = [];
           for (const row of table.values()) {
+            // claimLimit models the real RPC's batch size, so two concurrent
+            // "workers" against one fake each get their own rows.
+            if (opts.claimLimit !== undefined && claimed.length >= opts.claimLimit) break;
             if (row.status === "pending") {
               row.status = "in_progress";
               row.claimed_at = Date.now() - (opts.claimAgeMs ?? 0);
@@ -184,6 +187,17 @@ export function makeFakeSupabase(
         case "get_circuit_breaker_state": {
           const b = breakerFor(args!.p_destination_url as string);
           return { data: [{ state: b.state, next_probe_at: b.nextProbeAt }], error: null };
+        }
+
+        // Migration 010: one UPDATE that both tests "probe due" and pushes
+        // next_probe_at out, so exactly one caller gets true.
+        case "claim_circuit_probe": {
+          const b = breakerFor(args!.p_destination_url as string);
+          const due = b.state === "open" &&
+            (b.nextProbeAt === null || Date.parse(b.nextProbeAt) <= Date.now());
+          if (!due) return { data: false, error: null };
+          b.nextProbeAt = new Date(Date.now() + (args!.p_lease_seconds as number) * 1000).toISOString();
+          return { data: true, error: null };
         }
 
         case "record_delivery_success": {
