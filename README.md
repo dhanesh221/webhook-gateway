@@ -224,9 +224,9 @@ Refill uses a monotonic clock. Open circuit breakers defer without spending toke
 6. CLI + development tunnel (complete)
 7. Production polish (Phase A in this branch; live migration/deployment pending)
 
-### Dependency audit at Phase A review
+### Dependency audit
 
-The dependency patch updates Express/body-parser, `proxy-addr` and `qs` within their existing ranges. `npm audit --omit=dev` reports no runtime findings with the updated lockfile. The full audit still reports development-only localtunnel/axios and Vitest toolchain findings; npm proposes breaking changes for those, which were not applied. Re-run the audit before deployment because advisories change.
+The dependency patch updates Express/body-parser, `proxy-addr` and `qs` within their existing ranges. `npm audit --omit=dev` reports no runtime findings. Vitest was upgraded to 5 (with Vite 8), which cleared the test-runner findings (`@vitest/mocker`, `esbuild`, `tinypool`) without any test changes. The full audit's one remaining entry is axios 0.21 inside development-only localtunnel, reachable only when a developer opens a tunnel to loca.lt; replacing localtunnel would remove it. Re-run the audit before deployment because advisories change.
 
 ## Delivery safety (migration 009)
 
