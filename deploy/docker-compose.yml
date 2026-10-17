@@ -1,0 +1,40 @@
+# Gateway behind Caddy, which obtains and renews a Let's Encrypt certificate
+# for $GATEWAY_DOMAIN automatically. Copy deploy/env.example to deploy/.env,
+# fill it in, then from this directory:
+#
+#   docker compose up -d --build
+#
+# Ports 80 and 443 must reach this host and the domain's A/AAAA record must
+# point at it. The gateway itself is not published; only Caddy is.
+services:
+  gateway:
+    build: ..
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      # Caddy is the single hop in front of us, so one X-Forwarded-For entry is trusted.
+      TRUST_PROXY: "1"
+    expose:
+      - "3000"
+    stop_grace_period: 30s
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - gateway
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      GATEWAY_DOMAIN: ${GATEWAY_DOMAIN:?set GATEWAY_DOMAIN in deploy/.env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:
