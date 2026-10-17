@@ -283,6 +283,13 @@ export function makeFakeSupabase(
           return { data: matching, error: null };
         }
 
+        // Migration 013: queue depth for the metrics gauges.
+        case "count_webhook_events_by_status": {
+          const counts = new Map<string, number>();
+          for (const r of table.values()) counts.set(r.status, (counts.get(r.status) ?? 0) + 1);
+          return { data: [...counts.entries()].sort().map(([status, count]) => ({ status, count })), error: null };
+        }
+
         // Live shape: destination_url, state, consecutive_failures, opened_at,
         // next_probe_at, updated_at — one row per destination ever seen.
         case "list_circuit_breakers": {

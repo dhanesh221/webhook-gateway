@@ -59,6 +59,15 @@ export function configureTrustProxy(target: express.Express, value: string | und
 }
 configureTrustProxy(app, process.env.TRUST_PROXY);
 
+// Non-2xx ingest answers by status code, including the 400/413 the body parser
+// produces before the route runs. Status codes only: no source or client labels.
+app.use("/webhooks/:source", (_req, res, next) => {
+  res.on("finish", () => {
+    if (res.statusCode >= 300) gatewayMetrics.count("webhook_ingest_rejected_total", String(res.statusCode));
+  });
+  next();
+});
+
 app.use(
   express.json({
     limit: MAX_BODY_BYTES,

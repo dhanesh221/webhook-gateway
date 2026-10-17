@@ -14,6 +14,9 @@ import { getSupabase } from "./supabase";
 import { processPendingBatch } from "./deliveryWorker";
 import { defaultDeliveryLimiter } from "./rateLimit";
 import { runRetention, describeRetention, retentionPolicyFromEnv, RETENTION_INTERVAL_MS } from "./retention";
+import { gatewayMetrics, refreshDatabaseGauges } from "./metrics";
+
+export const GAUGE_REFRESH_INTERVAL_MS = 60 * 1000;
 
 export const DEFAULT_PORT = 3000;
 export const DEFAULT_POLL_INTERVAL_MS = 2000;
@@ -68,13 +71,29 @@ export function startWorker(intervalMs: number = DEFAULT_POLL_INTERVAL_MS): Work
   // first poll and then once per RETENTION_INTERVAL_MS. A failure is logged and
   // retried next hour; it must not stop deliveries.
   let lastRetentionAt = -Infinity;
+  // Queue depth and breaker gauges are read here, not at scrape time.
+  let lastGaugeRefreshAt = -Infinity;
+  let gaugeRefreshFailureLogged = false;
 
   async function tick(): Promise<void> {
     if (stopped) return;
     try {
       await processPendingBatch(getSupabase(), undefined, limiter);
+      gatewayMetrics.count("webhook_worker_polls_total", "ok");
     } catch (err) {
+      gatewayMetrics.count("webhook_worker_polls_total", "error");
       console.error(`[worker] unexpected error during poll: ${(err as Error).message}`);
+    }
+    if (!stopped && Date.now() - lastGaugeRefreshAt >= GAUGE_REFRESH_INTERVAL_MS) {
+      lastGaugeRefreshAt = Date.now();
+      try {
+        await refreshDatabaseGauges(getSupabase());
+      } catch (err) {
+        if (!gaugeRefreshFailureLogged) {
+          gaugeRefreshFailureLogged = true;
+          console.error(`[worker] metrics gauge refresh failed: ${(err as Error).message}; apply migrations/013 if missing`);
+        }
+      }
     }
     if (stopped || Date.now() - lastRetentionAt < RETENTION_INTERVAL_MS) return;
     lastRetentionAt = Date.now();

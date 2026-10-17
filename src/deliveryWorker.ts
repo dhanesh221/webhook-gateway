@@ -204,6 +204,7 @@ async function processRow(
         !breaker.next_probe_at || Date.parse(breaker.next_probe_at) <= Date.now();
 
       if (!probeDue) {
+        metrics.count("webhook_breaker_skips_total");
         results.push(await skipUntil(supabase, row, breaker.next_probe_at, "circuit open"));
         return;
       }
@@ -220,6 +221,7 @@ async function processRow(
         p_next_attempt_at: new Date(Date.now() + waitMs).toISOString(),
       });
       if (error) throw new Error("Failed to defer rate-limited event");
+      metrics.count("webhook_rate_limited_total");
       results.push({ id: row.id, outcome: "rate_limited", attempt: row.attempts });
       return;
     }
@@ -233,6 +235,7 @@ async function processRow(
         const current = await getCircuitBreakerState(supabase, row.destination_url);
         const until =
           current.next_probe_at ?? new Date(Date.now() + PROBE_LEASE_SECONDS * 1000).toISOString();
+        metrics.count("webhook_breaker_skips_total");
         results.push(await skipUntil(supabase, row, until, "probe already in flight elsewhere"));
         return;
       }
@@ -246,6 +249,7 @@ async function processRow(
     const headers = outboundHeaders(row, attemptNumber, body, await secrets.forSource(row.source));
 
     let result: DeliverResult;
+    const startedAt = process.hrtime.bigint();
     try {
       result = await deliver(row.destination_url, row.payload, rawBody, headers);
     } catch (err) {
@@ -254,6 +258,7 @@ async function processRow(
         `[worker] event ${row.id} attempt ${attemptNumber}: request error (${(err as Error).message})`
       );
     }
+    metrics.observeDeliveryDuration(Number(process.hrtime.bigint() - startedAt) / 1e9, result.ok);
 
     if (result.ok) {
       metrics.increment("delivered", row.source, row.destination_url);

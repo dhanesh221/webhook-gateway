@@ -8,6 +8,7 @@
 // The worker runs this once an hour (src/runtime.ts); `gateway retention purge`
 // runs it on demand. Both read the policy from the environment unless given one.
 import type { SupabaseClient } from "@supabase/supabase-js";
+import { gatewayMetrics } from "./metrics";
 
 export const DEFAULT_DELIVERED_DAYS = 30;
 export const DEFAULT_DEAD_LETTERED_DAYS = 90;
@@ -75,6 +76,10 @@ export async function runRetention(
   const { data: sessions, error: sessionsError } = await supabase.rpc("purge_dashboard_sessions");
   if (sessionsError) throw new Error(`purge_dashboard_sessions failed: ${sessionsError.message}`);
   result.sessionsDeleted = typeof sessions === "number" ? sessions : 0;
+
+  if (result.deliveredDeleted) gatewayMetrics.count("webhook_retention_purged_total", "delivered", BigInt(result.deliveredDeleted));
+  if (result.deadLetteredDeleted) gatewayMetrics.count("webhook_retention_purged_total", "dead_lettered", BigInt(result.deadLetteredDeleted));
+  if (result.sessionsDeleted) gatewayMetrics.count("webhook_retention_purged_total", "sessions", BigInt(result.sessionsDeleted));
 
   return result;
 }

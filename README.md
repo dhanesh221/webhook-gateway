@@ -48,6 +48,21 @@ printf 'header = "Authorization: Bearer %s"\n' "$WG_METRICS_TOKEN" | curl --conf
 | `webhook_events_retried_total` | Failed events whose retry-scheduling RPC returned without an error before attempt five. This counts acknowledged schedules, not the later retry attempt itself. |
 | `webhook_events_dead_lettered_total` | Failed events whose retry/DLQ RPC returned without an error at attempt five or later. |
 
+Operational series (migration 013 for the queue gauge). Each family appears only after its first observation, so a process that never used a feature exposes nothing for it; label values are enumerations or pseudonymous ids, never free text:
+
+| Series | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `webhook_events_queued` | gauge | `status` | Rows in the database per status, read by the **worker** about once a minute via `count_webhook_events_by_status`; scrapes never query the database |
+| `webhook_circuit_breaker_open`, `webhook_circuit_breaker_consecutive_failures` | gauge | `destination_id` | Breaker state per destination, same refresh, same SHA-256 pseudonyms as the route counters |
+| `webhook_delivery_duration_seconds` | histogram | `ok` | Time per delivery HTTP request |
+| `webhook_worker_polls_total` | counter | `result` | Poll cycles, `ok` or `error` |
+| `webhook_breaker_skips_total` | counter | | Events deferred by an open breaker or a probe leased to another worker |
+| `webhook_rate_limited_total` | counter | | Events deferred by the delivery rate limit |
+| `webhook_ingest_rejected_total` | counter | `status` | Non-2xx ingest answers by HTTP status code, including body-parser `400`/`413` |
+| `webhook_retention_purged_total` | counter | `kind` | Rows removed by retention: `delivered`, `dead_lettered`, `sessions` |
+
+Gauges are produced by the worker, so with a separately running `npm run worker` the ingest server's `/metrics` will not carry them (the same limitation as the delivery counters). Alert on `webhook_events_queued{status="dead_lettered"}` rising, `webhook_circuit_breaker_open` staying at 1, and `rate(webhook_events_retried_total[5m])`. Without migration 013 the worker logs the failed refresh once and everything else keeps working.
+
 Retry/DLQ metrics depend on the existing RPC contract. No live database readback is added. A thrown or returned DB error does not increment them. Breaker skips, rate-limit deferrals, failed claims and raw-body releases do not count as delivery attempts. Replays do not increment received; subsequent attempts increment delivered/failed normally. At-least-once redelivery can increase attempt counters more than once for the same event.
 
 Each total has a separate `webhook_events_<kind>_by_route_total` family with `source_id` and `destination_id` labels. These are SHA-256 hex digests of the exact source and destination URL, not raw text. Payloads, headers, IDs, URL credentials, query tokens and error messages are never exported. Hashes are pseudonyms, not encryption: someone with candidate values can hash them and correlate the labels. Authentication is still required. Different URL paths, trailing slashes and query strings get different IDs. `missing` represents a null destination; strings longer than 4096 UTF-16 code units are grouped as `oversized`.
@@ -235,7 +250,7 @@ Refill uses a monotonic clock. Open circuit breakers defer without spending toke
 
 - Confirm the reconstructed `migrations/000_base_schema.sql` against the live project: run `migrations/inspect_live_schema.sql`, diff the function bodies, correct 000 where they differ, then run `npm run verify:db` to check RPC presence and that anon is locked out.
 - Polls within one worker do not overlap, and open-breaker probes are leased across workers (010), so multiple worker processes can run; claims use the database's row locking.
-- Add a distinct outbound secret per destination, destination controls appropriate for any multi-tenant use, metrics and stable HTTPS hosting. Ingest and login limits are in-process; a shared limiter at the proxy is still needed for multi-instance deployments.
+- Add a distinct outbound secret per destination, destination controls appropriate for any multi-tenant use and stable HTTPS hosting. Ingest and login limits are in-process; a shared limiter at the proxy is still needed for multi-instance deployments.
 - Keep secrets separate from browser assets and logs. Service-role access has broad privileges; scope operational access to this dedicated gateway database.
 
 ## Phases
