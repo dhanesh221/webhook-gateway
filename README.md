@@ -10,6 +10,8 @@ Ingest returns `202` after an event is stored. An optional `Idempotency-Key` ded
 
 Delivery is **at least once**, not exactly once. If the destination accepts an event but the gateway fails before recording success, a retry may repeat the side effect. Downstream applications must implement their own deduplication. An `in_progress` event abandoned by a crashed worker is returned to `pending` after ten minutes (migration 009) without using an attempt, so it may be delivered again.
 
+Each delivery carries `X-Webhook-Event-Id` (the event's UUID, stable across retries and DLQ replays), `X-Webhook-Source`, `X-Webhook-Attempt`, and `Idempotency-Key` set to the same event id, so receivers can dedupe. When the worker can resolve the source's signing secret (the source is registered and its `secret_env` variable is set in the worker's environment) the delivery is also signed with `X-Webhook-Signature: t=<unix-seconds>,v2=<hex>` over `"v2\n" + t + "\n" + eventId + "\n" + body`, using the **same secret the sender uses** for that source; a receiver verifies it exactly as the gateway verifies inbound requests, with the event id as the key. If the secret cannot be resolved the delivery goes out unsigned with the identity headers and a warning is logged once per source per poll, so a worker missing one variable does not stall a queue. Receivers that require signatures will reject such deliveries, which then retry and dead-letter visibly. Each source therefore has one secret shared by its sender, the gateway, and its receiver; a separate outbound secret per destination is future work.
+
 Circuit breakers are shared by destination URL: five consecutive failures open a breaker for 60 seconds, then a single delivery probes it. The probe is leased (migration 010): the worker that wins the lease sends it, and any other worker that sees the same due breaker waits for the lease (30 seconds) or the probe's outcome, so a recovering destination gets one request however many workers run. Without migration 010 every worker probes, as before. Breaker skips do not consume event attempts. Sources using the same URL share a breaker.
 
 ## Process metrics
@@ -219,8 +221,8 @@ Refill uses a monotonic clock. Open circuit breakers defer without spending toke
 ## Remaining work before a public service
 
 - Confirm the reconstructed `migrations/000_base_schema.sql` against the live project: run `migrations/inspect_live_schema.sql`, diff the function bodies, correct 000 where they differ, then run `npm run verify:db` to check RPC presence and that anon is locked out.
-- Add stable event IDs in downstream delivery and downstream idempotency. Polls within one worker do not overlap, and open-breaker probes are leased across workers (010), so multiple worker processes can run; claims use the database's row locking.
-- Add outbound signing, destination controls appropriate for any multi-tenant use, stronger identity/rate limiting, retention, metrics and stable HTTPS hosting.
+- Polls within one worker do not overlap, and open-breaker probes are leased across workers (010), so multiple worker processes can run; claims use the database's row locking.
+- Add a distinct outbound secret per destination, destination controls appropriate for any multi-tenant use, stronger identity/rate limiting, retention, metrics and stable HTTPS hosting.
 - Keep secrets separate from browser assets and logs. Service-role access has broad privileges; scope operational access to this dedicated gateway database.
 
 ## Phases

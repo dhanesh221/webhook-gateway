@@ -3,6 +3,8 @@ import { computeBackoffDelay, MAX_ATTEMPTS } from "./backoff";
 import { defaultDeliveryLimiter, type DeliveryLimiter } from "./rateLimit";
 
 import { gatewayMetrics, type GatewayMetrics } from "./metrics";
+import { buildSignatureHeader, SIGNATURE_HEADER } from "./signature";
+import { sourceSecret, type SourceConfig } from "./sources";
 
 // Shape returned by the claim_pending_webhook_events RPC.
 export interface ClaimedWebhookEvent {
@@ -16,7 +18,39 @@ export interface ClaimedWebhookEvent {
 export type DeliverResult = { ok: boolean; status?: number };
 // rawBody is the exact bytes the sender posted, when stored. Delivering it avoids
 // the JSON.parse/stringify round trip, which rounds integers beyond 2^53.
-export type DeliverFn = (url: string, payload: unknown, rawBody?: string | null) => Promise<DeliverResult>;
+// headers carry the event identity and outbound signature (see outboundHeaders).
+export type DeliverFn = (
+  url: string, payload: unknown, rawBody?: string | null, headers?: Record<string, string>
+) => Promise<DeliverResult>;
+
+export const EVENT_ID_HEADER = "X-Webhook-Event-Id";
+export const EVENT_SOURCE_HEADER = "X-Webhook-Source";
+export const EVENT_ATTEMPT_HEADER = "X-Webhook-Attempt";
+
+// What a destination receives alongside the body. The event id is stable across
+// retries and DLQ replays, so a receiver can dedupe on it (it is also sent as
+// Idempotency-Key for receivers that already honour that header). When the
+// source's signing secret is available the delivery is signed with the gateway
+// protocol's v2 form, binding timestamp, event id and body together, using the
+// same secret the sender used, so the receiver verifies it as it would any
+// gateway-signed request with Idempotency-Key = event id.
+export function outboundHeaders(
+  event: { id: string; source: string },
+  attemptNumber: number,
+  body: string,
+  secret: string | null,
+  nowSeconds: number = Math.floor(Date.now() / 1000)
+): Record<string, string> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    [EVENT_ID_HEADER]: event.id,
+    [EVENT_SOURCE_HEADER]: event.source,
+    [EVENT_ATTEMPT_HEADER]: String(attemptNumber),
+    "Idempotency-Key": event.id,
+  };
+  if (secret) headers[SIGNATURE_HEADER] = buildSignatureHeader(secret, nowSeconds, body, event.id);
+  return headers;
+}
 
 // An event claimed (in_progress) for longer than this is assumed abandoned by a
 // crashed worker and returned to pending. Must exceed the longest plausible
@@ -32,13 +66,13 @@ export const PROBE_LEASE_SECONDS = 30;
 
 // Real HTTP delivery. Injectable so tests can point it at a local server, or
 // (for the backoff-only cases) skip real network calls entirely.
-const defaultDeliver: DeliverFn = async (url, payload, rawBody) => {
+const defaultDeliver: DeliverFn = async (url, payload, rawBody, headers) => {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), DELIVERY_TIMEOUT_MS);
   try {
     const res = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...headers },
       body: rawBody ?? JSON.stringify(payload),
       // A redirect would send the payload somewhere the registry never approved.
       // A 3xx is reported as a failed delivery instead.
@@ -112,12 +146,14 @@ export async function processPendingBatch(
     console.error(`[worker] could not read raw bodies (${(err as Error).message}); releasing batch`);
   }
 
+  const secrets = new SigningSecrets(supabase);
+
   for (const row of rows) {
     try {
       // An unreadable or missing row is not a legacy NULL body. Never rebuild
       // it from parsed JSON: that can silently round the sender's large IDs.
       if (!rawBodies?.has(row.id)) throw new Error("Stored raw body unavailable");
-      await processRow(supabase, deliver, row, rawBodies.get(row.id)!, results, limiter, metrics);
+      await processRow(supabase, deliver, row, rawBodies.get(row.id)!, results, limiter, metrics, secrets);
     } catch (err) {
       // One bad row must not strand it and every later claimed row in
       // in_progress. Hand it back to pending without spending an attempt.
@@ -147,7 +183,8 @@ async function processRow(
   rawBody: string | null,
   results: BatchOutcome[],
   limiter: DeliveryLimiter,
-  metrics: GatewayMetrics
+  metrics: GatewayMetrics,
+  secrets: SigningSecrets
 ): Promise<void> {
     const attemptNumber = row.attempts + 1;
 
@@ -205,9 +242,12 @@ async function processRow(
       );
     }
 
+    const body = rawBody ?? JSON.stringify(row.payload);
+    const headers = outboundHeaders(row, attemptNumber, body, await secrets.forSource(row.source));
+
     let result: DeliverResult;
     try {
-      result = await deliver(row.destination_url, row.payload, rawBody);
+      result = await deliver(row.destination_url, row.payload, rawBody, headers);
     } catch (err) {
       result = { ok: false };
       console.log(
@@ -296,6 +336,31 @@ async function claimProbe(
       );
     }
     return "unavailable";
+  }
+}
+
+// Resolves each source's signing secret once per batch. A source that is gone
+// from the registry, or whose secret this process does not have, is delivered
+// unsigned (as every delivery was before outbound signing) with a warning, so
+// a worker missing one environment variable does not stall that source's queue.
+class SigningSecrets {
+  private cache = new Map<string, string | null>();
+  constructor(private supabase: SupabaseClient) {}
+
+  async forSource(source: string): Promise<string | null> {
+    if (this.cache.has(source)) return this.cache.get(source)!;
+    let secret: string | null = null;
+    try {
+      const { data, error } = await this.supabase.rpc("get_webhook_source", { p_name: source });
+      if (error) throw new Error(error.message);
+      const row = (Array.isArray(data) ? data[0] : data) as SourceConfig | undefined;
+      if (!row) throw new Error("source not registered");
+      secret = sourceSecret(row);
+    } catch (err) {
+      console.warn(`[worker] delivering ${source} unsigned: ${(err as Error).message}`);
+    }
+    this.cache.set(source, secret);
+    return secret;
   }
 }
 
