@@ -30,7 +30,7 @@ describe("raw-body read failures", () => {
     read.mockRestore();
     await processPendingBatch(f.client, deliver);
     expect(deliver).toHaveBeenCalledTimes(2);
-    expect(deliver).toHaveBeenCalledWith("https://d.example/h", JSON.parse(raw), raw);
+    expect(deliver).toHaveBeenCalledWith("https://d.example/h", JSON.parse(raw), raw, expect.objectContaining({ "X-Webhook-Event-Id": expect.any(String) }));
   });
 
   it("releases a missing read result instead of treating it as legacy NULL", async () => {
