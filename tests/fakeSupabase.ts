@@ -31,6 +31,7 @@ export interface FakeRow extends ClaimedWebhookEvent {
   idempotency_key?: string | null;
   raw_body?: string | null;
   claimed_at?: number | null;
+  headers?: Record<string, unknown>;
 }
 
 interface FakeBreaker {
@@ -49,7 +50,7 @@ export function makeFakeSupabase(
   const table = new Map<string, FakeRow>(
     rows.map((r) => [r.id, { ...r, status: "pending" }])
   );
-  const sources = new Map<string, {name: string; destination_url: string; secret_env: string; enabled: boolean}>();
+  const sources = new Map<string, {name: string; destination_url: string; secret_env: string; enabled: boolean; signature_scheme: string}>();
   const sessions = new Map<string, {expires: number; revoked: boolean}>();
   const breakers = new Map<string, FakeBreaker>();
 
@@ -97,6 +98,7 @@ export function makeFakeSupabase(
             payload: row.payload,
             destination_url: (row.destination_url ?? null) as string | null,
             raw_body: (row.raw_body ?? null) as string | null,
+            headers: (row.headers ?? {}) as Record<string, unknown>,
             status: "pending",
           });
           return { data: null, error: null };
@@ -118,7 +120,8 @@ export function makeFakeSupabase(
         case "get_webhook_source": return { data: [sources.get(args!.p_name as string)].filter(Boolean), error: null };
         case "list_webhook_sources": return { data: [...sources.values()], error: null };
         case "upsert_webhook_source": {
-          sources.set(args!.p_name as string, {name: args!.p_name as string, destination_url: args!.p_destination_url as string, secret_env: args!.p_secret_env as string, enabled: true});
+          // Migration 011: 4-argument upsert; scheme defaults to gateway.
+          sources.set(args!.p_name as string, {name: args!.p_name as string, destination_url: args!.p_destination_url as string, secret_env: args!.p_secret_env as string, enabled: true, signature_scheme: (args!.p_signature_scheme as string | undefined) ?? "gateway"});
           return { data: null, error: null };
         }
         case "disable_webhook_source": {
