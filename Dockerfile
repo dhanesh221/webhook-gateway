@@ -19,8 +19,8 @@ COPY --from=build /app/dist ./dist
 COPY public ./public
 USER node
 EXPOSE 3000
-# /ready fails while the database is unreachable; /health only says the process is up.
+# /health is a readiness check: 503 while the database is unreachable.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 # Server and worker in one process; SIGTERM drains in-flight deliveries.
 CMD ["node", "dist/cli.js", "start", "--no-tunnel"]

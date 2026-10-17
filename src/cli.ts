@@ -87,7 +87,7 @@ export function formatStartupBanner(
 
   if (production && !publicUrl) {
     lines.push(`Your gateway is listening on port ${port} (NODE_ENV=production).`);
-    lines.push("Expose it only through your HTTPS reverse proxy; see README, Deployment.");
+    lines.push("Expose it only through your HTTPS reverse proxy; see README, Deploy settings.");
     lines.push("");
     lines.push("Dashboard: /dashboard.html on your public domain. Credentials come from the environment.");
     lines.push("");

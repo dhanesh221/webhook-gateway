@@ -11,7 +11,7 @@
 		max_size 2MB
 	}
 	reverse_proxy gateway:3000 {
-		health_uri /ready
+		health_uri /health
 		health_interval 15s
 	}
 }
