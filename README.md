@@ -117,7 +117,7 @@ unset WG_PASSWORD
 npm run gateway -- sessions-revoke-all
 ```
 
-Only one operator account is supported. No email reset flow, user registration, MFA, or distributed login rate limiting is provided. Do not confuse a revocable single-operator dashboard with a hosted identity service. Cookies are httpOnly, SameSite=Lax, path `/`, and Secure when `NODE_ENV=production`. Serve production behind HTTPS and protect login with rate limiting at your reverse proxy before public deployment.
+Only one operator account is supported. No email reset flow, user registration, MFA, or distributed login rate limiting is provided. Do not confuse a revocable single-operator dashboard with a hosted identity service. Cookies are httpOnly, SameSite=Lax, path `/`, and Secure when `NODE_ENV=production`. Serve production behind HTTPS, set `TRUST_PROXY` so the per-client throttles see real client addresses, and add rate limiting at your reverse proxy as well before public deployment.
 
 ## Database access and migration
 
@@ -148,13 +148,20 @@ WG_SOURCE_PAYMENTS_SECRET=your-high-entropy-source-secret
 # ADMIN_PASSWORD_HASH='...'
 # SESSION_SECRET='...'
 # Set NODE_ENV=production only when served over HTTPS.
+# Behind a reverse proxy, tell Express which proxies to trust so req.ip (login
+# throttle, ingest limits) is the real client: a hop count, "loopback", a CIDR
+# list, or "true" (only if nothing can reach the port directly). Unset = none.
+# TRUST_PROXY=1
+# Ingest limits per minute, in memory per process; 0 disables.
+# WG_INGEST_RATE_PER_MINUTE=600            # per source, all requests
+# WG_INGEST_AUTH_FAILURES_PER_MINUTE=30    # per client address, 401/404 answers
 ```
 
 Signing secret example generation: `openssl rand -hex 32`. Keep the generated value private and share it only through your sender's secure configuration path. Source secrets, the service-role key and session secret require secure collection, never chat.
 
 ## Deploy settings
 
-Set `NODE_ENV=production` and serve the gateway over HTTPS so session cookies are Secure. Express currently leaves `trust proxy` off. If deployment has exactly one trusted reverse proxy in front, set `app.set("trust proxy", 1)` after creating the app in `src/app.ts`. Verify the actual proxy path with the host; do not assume every Render/Fly setup has one hop. Leave it off for direct access. Multiple proxies need a separately reviewed configuration.
+Set `NODE_ENV=production` and serve the gateway over HTTPS so session cookies are Secure. Express leaves `trust proxy` off unless `TRUST_PROXY` is set. With exactly one trusted reverse proxy in front, set `TRUST_PROXY=1`; Express also accepts `loopback`, a CIDR or comma-separated list, or `true` (only when nothing can reach the port directly). Verify the actual proxy path with the host; do not assume every Render/Fly setup has one hop. Leave it unset for direct access. Multiple proxies need a separately reviewed value.
 
 A wrong `trust proxy` setting can let callers spoof their client address through forwarded headers and bypass the per-address login throttle, even with a patched `proxy-addr`. Do not enable it blindly or allow a shorter route around the trusted proxy.
 
@@ -210,7 +217,7 @@ Refill uses a monotonic clock. Open circuit breakers defer without spending toke
 ## HTTP endpoints
 
 - `GET /health`: public readiness check. Returns `200 {"status":"ok"}` when the database accepts a zero-row query for the ingest columns, including `raw_body`; returns `503 {"status":"unavailable"}` on missing schema, configuration or database access failure. The database request times out after 3 seconds. It creates no probe events. This detects a missing migration 009 column, but does not prove INSERT permissions, constraints or worker RPC readiness.
-- `POST /webhooks/:source`: non-empty JSON body, 1 MB cap; source is 1-64 letters/digits/underscore/hyphen. `202` stored, `200` duplicate, `400` invalid input, `401` invalid signature, `415` body is not `application/json`, `404` unknown/disabled source, `413` oversized body, `503` unusable source configuration, `500` storage/server failure.
+- `POST /webhooks/:source`: non-empty JSON body, 1 MB cap; source is 1-64 letters/digits/underscore/hyphen. `202` stored, `200` duplicate, `400` invalid input, `401` invalid signature, `415` body is not `application/json`, `404` unknown/disabled source, `413` oversized body, `429` with `Retry-After` when the source exceeds `WG_INGEST_RATE_PER_MINUTE` or the client address has exceeded `WG_INGEST_AUTH_FAILURES_PER_MINUTE` recent `401`/`404` answers, `503` unusable source configuration, `500` storage/server failure. Limits are checked before the registry is read.
 - `POST /api/login`: `{ "password": "..." }`; creates cookie after credential and durable-session storage success.
 - `POST /api/logout`: revokes this session and clears cookie. Still works with no/invalid cookie; reports failure if revocation storage is unavailable.
 - `GET /api/events?status=...`: authenticated event table, latest 100; valid filters `pending`, `in_progress`, `delivered`, `failed`, `dead_lettered`. Payloads/headers excluded from dashboard response.
@@ -222,7 +229,7 @@ Refill uses a monotonic clock. Open circuit breakers defer without spending toke
 
 - Confirm the reconstructed `migrations/000_base_schema.sql` against the live project: run `migrations/inspect_live_schema.sql`, diff the function bodies, correct 000 where they differ, then run `npm run verify:db` to check RPC presence and that anon is locked out.
 - Polls within one worker do not overlap, and open-breaker probes are leased across workers (010), so multiple worker processes can run; claims use the database's row locking.
-- Add a distinct outbound secret per destination, destination controls appropriate for any multi-tenant use, stronger identity/rate limiting, retention, metrics and stable HTTPS hosting.
+- Add a distinct outbound secret per destination, destination controls appropriate for any multi-tenant use, retention, metrics and stable HTTPS hosting. Ingest and login limits are in-process; a shared limiter at the proxy is still needed for multi-instance deployments.
 - Keep secrets separate from browser assets and logs. Service-role access has broad privileges; scope operational access to this dedicated gateway database.
 
 ## Phases
@@ -248,4 +255,4 @@ Apply `migrations/009_crash_safety_raw_body.sql` before running this version; in
 - A failure while handling one claimed event releases that event to `pending` instead of leaving it, and the rest of the batch, in `in_progress`.
 - Events left `in_progress` for more than ten minutes (a crashed worker) are returned to `pending` on the next poll. Attempts are not incremented, so such an event can be delivered a second time; receivers should tolerate duplicates.
 - Delivery does not follow redirects; a 3xx counts as a failed attempt.
-- Dashboard login allows 5 failed attempts per client address per 15 minutes (50 across all clients), then answers `429` with `Retry-After`. The counters are in memory and reset on restart.
+- Dashboard login allows 5 failed attempts per client address per 15 minutes (50 across all clients), then answers `429` with `Retry-After`. Ingest allows `WG_INGEST_RATE_PER_MINUTE` requests per source and `WG_INGEST_AUTH_FAILURES_PER_MINUTE` failed authentications per client address, then `429`. All counters are in memory and reset on restart; set `TRUST_PROXY` behind a reverse proxy or every client shares one bucket.

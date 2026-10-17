@@ -11,6 +11,7 @@ import { getSource, sourceScheme, sourceSecret, SOURCE_PATTERN, validateDestinat
 import type { SignatureScheme } from "./adapters";
 import { asyncRoute } from "./asyncRoute";
 import { gatewayMetrics, hasMetricsBearer } from "./metrics";
+import { clientRetryAfterSeconds, recordClientAuthFailure, sourceRetryAfterSeconds } from "./ingestLimiter";
 export { SOURCE_PATTERN } from "./sources";
 
 // Chosen deliberately rather than inherited. express.json() defaults to 100 KB,
@@ -42,6 +43,21 @@ app.use(helmet({
     },
   },
 }));
+
+// req.ip is the socket peer unless Express is told which proxies to trust. Behind
+// a reverse proxy that is the proxy's address, so every client would share one
+// login-throttle and ingest-limit bucket. TRUST_PROXY takes Express's forms:
+// a hop count ("1"), "loopback", a CIDR or comma-separated list, or "true"
+// (trust every X-Forwarded-For, only safe when nothing can reach the port
+// directly). Unset means no proxy is trusted.
+export function configureTrustProxy(target: express.Express, value: string | undefined): void {
+  const v = (value ?? "").trim();
+  if (v === "" || v.toLowerCase() === "false") { target.set("trust proxy", false); return; }
+  if (v.toLowerCase() === "true") { target.set("trust proxy", true); return; }
+  if (/^\d+$/.test(v)) { target.set("trust proxy", Number(v)); return; }
+  target.set("trust proxy", v);
+}
+configureTrustProxy(app, process.env.TRUST_PROXY);
 
 app.use(
   express.json({
@@ -100,8 +116,25 @@ app.post("/webhooks/:source", asyncRoute(async (req, res) => {
     return res.status(415).json({ error: "Content-Type must be application/json" });
   }
 
+  // Limits are applied before the registry read so a flood never reaches the
+  // database. A client that keeps failing authentication is answered first.
+  const client = req.ip ?? "unknown";
+  const clientWait = clientRetryAfterSeconds(client);
+  if (clientWait > 0) {
+    res.set("Retry-After", String(clientWait));
+    return res.status(429).json({ error: "Too many failed requests, try again later" });
+  }
+  const sourceWait = sourceRetryAfterSeconds(source);
+  if (sourceWait > 0) {
+    res.set("Retry-After", String(sourceWait));
+    return res.status(429).json({ error: "Rate limit exceeded for this source" });
+  }
+
   const route = await getSource(source);
-  if (!route || !route.enabled) return res.status(404).json({ error: "Source unavailable" });
+  if (!route || !route.enabled) {
+    recordClientAuthFailure(client);
+    return res.status(404).json({ error: "Source unavailable" });
+  }
   // Configuration failures are 503, not an unsigned fallback. Never disclose
   // the environment variable name or secret to the caller.
   let signingSecret: string;
@@ -124,6 +157,7 @@ app.post("/webhooks/:source", asyncRoute(async (req, res) => {
   });
   if (!result.ok) {
     console.warn(`[ingest] rejected ${source}: ${result.reason}`);
+    recordClientAuthFailure(client);
     return res.status(401).json({ error: "Invalid signature" });
   }
   const idempotencyKey = result.idempotencyKey;
