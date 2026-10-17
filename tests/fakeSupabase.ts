@@ -32,6 +32,8 @@ export interface FakeRow extends ClaimedWebhookEvent {
   raw_body?: string | null;
   claimed_at?: number | null;
   headers?: Record<string, unknown>;
+  // Epoch ms of the last status change; rows seeded without it count as "now".
+  updated_at?: number;
 }
 
 interface FakeBreaker {
@@ -170,6 +172,7 @@ export function makeFakeSupabase(
         case "mark_webhook_event_delivered": {
           const row = table.get(args!.p_id as string)!;
           row.status = "delivered";
+          row.updated_at = Date.now();
           return { data: null, error: null };
         }
 
@@ -178,7 +181,36 @@ export function makeFakeSupabase(
           row.attempts += 1;
           const maxAttempts = (args!.p_max_attempts as number) ?? 5;
           row.status = row.attempts >= maxAttempts ? "dead_lettered" : "pending";
+          row.updated_at = Date.now();
           return { data: null, error: null };
+        }
+
+        // Migration 012. Deletes finished rows older than the cutoff, by status,
+        // up to p_batch of each; null/0 age leaves that status alone.
+        case "purge_webhook_events": {
+          const batch = (args!.p_batch as number) ?? 5000;
+          const purge = (status: string, ageSeconds: number | null | undefined) => {
+            if (!ageSeconds || ageSeconds <= 0) return 0;
+            const cutoff = Date.now() - ageSeconds * 1000;
+            const victims = [...table.values()]
+              .filter((r) => r.status === status && (r.updated_at ?? Date.now()) < cutoff)
+              .sort((a, b) => (a.updated_at ?? 0) - (b.updated_at ?? 0))
+              .slice(0, batch);
+            for (const v of victims) table.delete(v.id);
+            return victims.length;
+          };
+          return { data: [{
+            delivered_deleted: purge("delivered", args!.p_delivered_after_seconds as number | null),
+            dead_lettered_deleted: purge("dead_lettered", args!.p_dead_lettered_after_seconds as number | null),
+          }], error: null };
+        }
+
+        case "purge_dashboard_sessions": {
+          let n = 0;
+          for (const [id, s] of sessions) {
+            if (s.revoked || s.expires < Date.now()) { sessions.delete(id); n++; }
+          }
+          return { data: n, error: null };
         }
 
         case "mark_webhook_event_skipped": {

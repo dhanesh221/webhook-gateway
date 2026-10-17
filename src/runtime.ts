@@ -13,6 +13,7 @@ import { app } from "./app";
 import { getSupabase } from "./supabase";
 import { processPendingBatch } from "./deliveryWorker";
 import { defaultDeliveryLimiter } from "./rateLimit";
+import { runRetention, describeRetention, retentionPolicyFromEnv, RETENTION_INTERVAL_MS } from "./retention";
 
 export const DEFAULT_PORT = 3000;
 export const DEFAULT_POLL_INTERVAL_MS = 2000;
@@ -63,6 +64,10 @@ export function startWorker(intervalMs: number = DEFAULT_POLL_INTERVAL_MS): Work
   const limiter = defaultDeliveryLimiter();
   let stopped = false;
   let timer: NodeJS.Timeout | undefined;
+  // Retention runs inside the poll, never concurrently with a batch, on the
+  // first poll and then once per RETENTION_INTERVAL_MS. A failure is logged and
+  // retried next hour; it must not stop deliveries.
+  let lastRetentionAt = -Infinity;
 
   async function tick(): Promise<void> {
     if (stopped) return;
@@ -70,6 +75,14 @@ export function startWorker(intervalMs: number = DEFAULT_POLL_INTERVAL_MS): Work
       await processPendingBatch(getSupabase(), undefined, limiter);
     } catch (err) {
       console.error(`[worker] unexpected error during poll: ${(err as Error).message}`);
+    }
+    if (stopped || Date.now() - lastRetentionAt < RETENTION_INTERVAL_MS) return;
+    lastRetentionAt = Date.now();
+    try {
+      const policy = retentionPolicyFromEnv();
+      console.log(`[worker] ${describeRetention(policy, await runRetention(getSupabase(), policy))}`);
+    } catch (err) {
+      console.error(`[worker] retention failed: ${(err as Error).message}; apply migrations/012 if missing`);
     }
   }
 

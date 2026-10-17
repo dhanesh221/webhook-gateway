@@ -15,7 +15,14 @@ vi.mock("../src/supabase", () => ({
   getSupabase: () => ({}),
 }));
 
+const retention = vi.hoisted(() => ({ runRetention: vi.fn() }));
+vi.mock("../src/retention", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/retention")>()),
+  runRetention: retention.runRetention,
+}));
+
 import { startWorker } from "../src/runtime";
+import { RETENTION_INTERVAL_MS } from "../src/retention";
 
 interface Batch {
   release(): void;
@@ -52,10 +59,15 @@ function trackBatches() {
 beforeEach(() => {
   vi.useFakeTimers();
   mocks.processPendingBatch.mockReset();
+  retention.runRetention.mockReset();
+  retention.runRetention.mockResolvedValue({ deliveredDeleted: 0, deadLetteredDeleted: 0, sessionsDeleted: 0 });
+  vi.spyOn(console, "log").mockImplementation(() => {});
+  vi.spyOn(console, "error").mockImplementation(() => {});
 });
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.restoreAllMocks();
 });
 
 describe("startWorker", () => {
@@ -105,6 +117,32 @@ describe("startWorker", () => {
     const callsAtClose = mocks.processPendingBatch.mock.calls.length;
     await vi.advanceTimersByTimeAsync(1_000);
     expect(mocks.processPendingBatch).toHaveBeenCalledTimes(callsAtClose);
+  });
+
+  it("runs retention after the first poll and then once an hour, never alongside a batch", async () => {
+    mocks.processPendingBatch.mockImplementation(async () => []);
+    const worker = startWorker(100);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(retention.runRetention).toHaveBeenCalledTimes(1);
+
+    // Many polls, well under an hour: no second run.
+    await vi.advanceTimersByTimeAsync(RETENTION_INTERVAL_MS - 1_000);
+    expect(retention.runRetention).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(retention.runRetention).toHaveBeenCalledTimes(2);
+    expect(mocks.processPendingBatch.mock.calls.length).toBeGreaterThan(100);
+    await worker.close();
+  });
+
+  it("a retention failure is logged and deliveries continue", async () => {
+    mocks.processPendingBatch.mockImplementation(async () => []);
+    retention.runRetention.mockRejectedValue(new Error("function purge_webhook_events does not exist"));
+    const worker = startWorker(100);
+    await vi.advanceTimersByTimeAsync(350);
+    expect(mocks.processPendingBatch.mock.calls.length).toBeGreaterThanOrEqual(3);
+    expect((console.error as unknown as { mock: { calls: unknown[][] } }).mock.calls.some(
+      (c) => String(c[0]).includes("retention failed"))).toBe(true);
+    await worker.close();
   });
 
   it("close() between polls resolves without starting another batch", async () => {

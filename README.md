@@ -98,7 +98,7 @@ The header above is the gateway's own protocol, the `gateway` scheme. A source c
 
 A request carrying the wrong scheme's header for its source is rejected with `401`, the same as any other signature failure. A source whose stored scheme is unrecognised answers `503`.
 
-Authentication headers (`X-Webhook-Signature`, `X-Hub-Signature-256`, `X-Hub-Signature`, `Stripe-Signature`, `Authorization`, `Cookie`) are excluded from stored event headers. Payloads and other headers may still contain sensitive data; set retention and access rules accordingly.
+Authentication headers (`X-Webhook-Signature`, `X-Hub-Signature-256`, `X-Hub-Signature`, `Stripe-Signature`, `Authorization`, `Cookie`) are excluded from stored event headers. Payloads and other headers may still contain sensitive data; retention (below) bounds how long they are kept, and access rules remain the operator's responsibility.
 
 ### Dashboard credentials and revocable sessions
 
@@ -155,6 +155,10 @@ WG_SOURCE_PAYMENTS_SECRET=your-high-entropy-source-secret
 # Ingest limits per minute, in memory per process; 0 disables.
 # WG_INGEST_RATE_PER_MINUTE=600            # per source, all requests
 # WG_INGEST_AUTH_FAILURES_PER_MINUTE=30    # per client address, 401/404 answers
+# Retention (days; 0 keeps forever). Applied hourly by the worker and by
+# `gateway retention purge`. Pending/in-progress/failed events are never purged.
+# WG_RETAIN_DELIVERED_DAYS=30
+# WG_RETAIN_DEAD_LETTERED_DAYS=90
 ```
 
 Signing secret example generation: `openssl rand -hex 32`. Keep the generated value private and share it only through your sender's secure configuration path. Source secrets, the service-role key and session secret require secure collection, never chat.
@@ -195,6 +199,8 @@ Localtunnel is a development convenience: its URL is ephemeral, may show an inte
 ```bash
 npm run gateway -- dlq list
 npm run gateway -- dlq replay <event-id>
+npm run gateway -- retention purge                       # policy from .env.local
+npm run gateway -- retention purge --dead-lettered-days 0  # keep the DLQ, purge delivered
 ```
 
 Tests use fake Supabase RPC storage and real local HTTP receivers. They cover routing, source isolation, signing, idempotency, retries, DLQ/replay, breakers, session creation/revocation and failure handling. Passing these tests is not a live Supabase migration or deployment check. `npm run test:migrations` (Docker) checks the SQL itself against a real Postgres, and `npm run verify:db` checks the live project.
@@ -229,7 +235,7 @@ Refill uses a monotonic clock. Open circuit breakers defer without spending toke
 
 - Confirm the reconstructed `migrations/000_base_schema.sql` against the live project: run `migrations/inspect_live_schema.sql`, diff the function bodies, correct 000 where they differ, then run `npm run verify:db` to check RPC presence and that anon is locked out.
 - Polls within one worker do not overlap, and open-breaker probes are leased across workers (010), so multiple worker processes can run; claims use the database's row locking.
-- Add a distinct outbound secret per destination, destination controls appropriate for any multi-tenant use, retention, metrics and stable HTTPS hosting. Ingest and login limits are in-process; a shared limiter at the proxy is still needed for multi-instance deployments.
+- Add a distinct outbound secret per destination, destination controls appropriate for any multi-tenant use, metrics and stable HTTPS hosting. Ingest and login limits are in-process; a shared limiter at the proxy is still needed for multi-instance deployments.
 - Keep secrets separate from browser assets and logs. Service-role access has broad privileges; scope operational access to this dedicated gateway database.
 
 ## Phases
@@ -246,6 +252,10 @@ Refill uses a monotonic clock. Open circuit breakers defer without spending toke
 ### Dependency audit
 
 The dependency patch updates Express/body-parser, `proxy-addr` and `qs` within their existing ranges. `npm audit --omit=dev` reports no runtime findings. Vitest was upgraded to 5 (with Vite 8), which cleared the test-runner findings (`@vitest/mocker`, `esbuild`, `tinypool`) without any test changes. The full audit's one remaining entry is axios 0.21 inside development-only localtunnel, reachable only when a developer opens a tunnel to loca.lt; replacing localtunnel would remove it. Re-run the audit before deployment because advisories change.
+
+## Retention (migration 012)
+
+Delivered events are kept `WG_RETAIN_DELIVERED_DAYS` (default 30) and dead-lettered events `WG_RETAIN_DEAD_LETTERED_DAYS` (default 90), measured from their last status change; older ones are deleted, along with expired and revoked dashboard sessions. Pending, in-progress and failed events are never purged. The worker runs the purge after its first poll and then hourly, in batches of 5000 rows per status so a backlog never becomes one long-locking delete; `gateway retention purge` runs it on demand with optional overrides. Set a value to `0` to keep that status forever. Without migration 012 the worker logs the failure once an hour and deliveries continue.
 
 ## Delivery safety (migration 009)
 
