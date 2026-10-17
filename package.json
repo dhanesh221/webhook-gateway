@@ -11,7 +11,9 @@
     "worker": "tsx src/worker.ts",
     "dlq": "tsx src/dlq.ts",
     "setup:auth": "tsx src/setupAuth.ts",
-    "test": "vitest run"
+    "verify:db": "tsx scripts/verify-db.ts",
+    "test": "vitest run",
+    "test:migrations": "scripts/test-migrations.sh"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.112.3",
