@@ -66,6 +66,8 @@ Destinations must be HTTPS. Loopback HTTP (`localhost`, `127.0.0.1`, or `::1`) i
 
 ```bash
 npm run gateway -- sources set payments https://receiver.example/hook WG_SOURCE_PAYMENTS_SECRET
+npm run gateway -- sources set repo-events https://receiver.example/gh WG_SOURCE_REPO_EVENTS_SECRET --scheme github
+npm run gateway -- sources set stripe https://receiver.example/stripe WG_SOURCE_STRIPE_SECRET --scheme stripe
 npm run gateway -- sources list
 npm run gateway -- sources disable payments
 ```
@@ -84,9 +86,17 @@ Sign the exact UTF-8 body as `${timestamp}.${rawBody}` with the source secret. T
 
 If you send an `Idempotency-Key`, sign it too, using the `v2` form: header `t=<timestamp>,v2=<hex>` where the MAC is HMAC-SHA256 over `"v2\n" + timestamp + "\n" + key + "\n" + rawBody`. A request carrying a key with a `v1` signature is rejected, so a captured request cannot be resent under a different key. Requests without a key keep using `t=...,v1=...` unchanged.
 
-This is a **custom protocol**, not a native GitHub or Stripe adapter. GitHub's `X-Hub-Signature-256` and Stripe's `Stripe-Signature` are not accepted directly. Provider-specific adapters are future work; a label named `stripe` does not make this Stripe-compatible.
+The header above is the gateway's own protocol, the `gateway` scheme. A source can instead declare a provider-native scheme with `--scheme` (migration 011); the scheme is a property of the source, so a label named `stripe` is Stripe-compatible only if it was registered with `--scheme stripe`. Every scheme uses the same `secret_env` convention and the same 32-byte minimum; GitHub lets you choose the secret, so generate it with `openssl rand -hex 32`, and Stripe's `whsec_...` signing secrets already qualify.
 
-Authentication headers (`X-Webhook-Signature`, `Authorization`, `Cookie`) are excluded from stored event headers. Payloads and other headers may still contain sensitive data; set retention and access rules accordingly.
+| Scheme | Verifies | Dedupes on | Replay window |
+|---|---|---|---|
+| `gateway` (default) | `X-Webhook-Signature: t=,v1=` or `v2=` over `t.body` (and the key) | `Idempotency-Key` header | 5 minutes |
+| `github` | `X-Hub-Signature-256: sha256=<HMAC-SHA256 of body>` | `X-GitHub-Delivery`, else `Idempotency-Key`, else none | **unbounded**: GitHub signs no timestamp, so a captured request stays valid; the delivery id dedupes an honest redelivery only |
+| `stripe` | `Stripe-Signature: t=,v1=` over `t.body`; any of several `v1` values may match (secret rotation) | the event's `id` field, else `Idempotency-Key`, else none | 5 minutes |
+
+A request carrying the wrong scheme's header for its source is rejected with `401`, the same as any other signature failure. A source whose stored scheme is unrecognised answers `503`.
+
+Authentication headers (`X-Webhook-Signature`, `X-Hub-Signature-256`, `X-Hub-Signature`, `Stripe-Signature`, `Authorization`, `Cookie`) are excluded from stored event headers. Payloads and other headers may still contain sensitive data; set retention and access rules accordingly.
 
 ### Dashboard credentials and revocable sessions
 
@@ -210,7 +220,7 @@ Refill uses a monotonic clock. Open circuit breakers defer without spending toke
 
 - Confirm the reconstructed `migrations/000_base_schema.sql` against the live project: run `migrations/inspect_live_schema.sql`, diff the function bodies, correct 000 where they differ, then run `npm run verify:db` to check RPC presence and that anon is locked out.
 - Add stable event IDs in downstream delivery and downstream idempotency. Polls within one worker do not overlap, and open-breaker probes are leased across workers (010), so multiple worker processes can run; claims use the database's row locking.
-- Add provider-native signature adapters and outbound signing, destination controls appropriate for any multi-tenant use, stronger identity/rate limiting, retention, metrics and stable HTTPS hosting.
+- Add outbound signing, destination controls appropriate for any multi-tenant use, stronger identity/rate limiting, retention, metrics and stable HTTPS hosting.
 - Keep secrets separate from browser assets and logs. Service-role access has broad privileges; scope operational access to this dedicated gateway database.
 
 ## Phases
@@ -230,7 +240,7 @@ The dependency patch updates Express/body-parser, `proxy-addr` and `qs` within t
 
 ## Delivery safety (migration 009)
 
-Apply `migrations/009_crash_safety_raw_body.sql` before running this version; ingest writes the new `raw_body` column and fails without it. Then apply `migrations/010_circuit_probe_lease.sql`; without it the worker logs once and probes open breakers unleased.
+Apply `migrations/009_crash_safety_raw_body.sql` before running this version; ingest writes the new `raw_body` column and fails without it. Then apply `migrations/010_circuit_probe_lease.sql`; without it the worker logs once and probes open breakers unleased. Apply `migrations/011_signature_schemes.sql` as well: `sources set` calls the 4-argument `upsert_webhook_source` it defines (existing rows keep the `gateway` scheme and ingest for them is unchanged).
 
 - Events are delivered as the exact bytes received, so integers above 2^53 and the sender's formatting arrive intact. Rows with an explicit NULL raw body (stored before the migration) fall back to the parsed payload. A failed raw-body read releases the batch for retry without spending delivery attempts; a missing or unreadable row is released too. No parsed-payload fallback is used on a read failure.
 - A failure while handling one claimed event releases that event to `pending` instead of leaving it, and the rest of the batch, in `in_progress`.

@@ -12,6 +12,7 @@ import dotenv from "dotenv";
 dotenv.config({ path: ".env.local", quiet: true });
 
 import { saveSource, listSources, disableSource } from "./sources";
+import { DEFAULT_SIGNATURE_SCHEME, SIGNATURE_SCHEMES } from "./adapters";
 import { revokeAllSessions } from "./auth";
 import { Command, CommanderError } from "commander";
 import {
@@ -232,13 +233,14 @@ export function buildProgram(deps: CliDeps): Command {
   const sources = program.command("sources").description("Manage operator-owned source routes");
   sources.command("set <name> <destination-url> <secret-env>")
     .description("Create/update and enable a source; pass the env variable NAME, never the secret")
-    .action(async (name, destination, secretEnv) => {
-      await (deps.saveSource ?? saveSource)(name, destination, secretEnv);
-      deps.log(`Source ${name} saved. Previously queued events retain their destination.`);
+    .option("--scheme <scheme>", `how the sender signs: ${SIGNATURE_SCHEMES.join(" | ")}`, DEFAULT_SIGNATURE_SCHEME)
+    .action(async (name, destination, secretEnv, options: { scheme: string }) => {
+      await (deps.saveSource ?? saveSource)(name, destination, secretEnv, options.scheme);
+      deps.log(`Source ${name} saved (${options.scheme} signatures). Previously queued events retain their destination.`);
     });
   sources.command("list").action(async () => {
     for (const row of await (deps.listSources ?? listSources)())
-      deps.log(`${row.name} ${row.enabled ? "enabled" : "disabled"} ${row.destination_url} ${row.secret_env}`);
+      deps.log(`${row.name} ${row.enabled ? "enabled" : "disabled"} ${row.signature_scheme ?? DEFAULT_SIGNATURE_SCHEME} ${row.destination_url} ${row.secret_env}`);
   });
   sources.command("disable <name>").action(async name => {
     await (deps.disableSource ?? disableSource)(name);

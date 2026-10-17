@@ -1,4 +1,5 @@
 import { getSupabase } from "./supabase";
+import { DEFAULT_SIGNATURE_SCHEME, isSignatureScheme, SIGNATURE_SCHEMES, type SignatureScheme } from "./adapters";
 
 export const SOURCE_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 export const SECRET_ENV_PATTERN = /^WG_SOURCE_[A-Z0-9_]+_SECRET$/;
@@ -7,6 +8,17 @@ export interface SourceConfig {
   destination_url: string;
   secret_env: string;
   enabled: boolean;
+  // Absent on rows read from a database without migration 011: means gateway.
+  signature_scheme?: string | null;
+}
+
+// How this source's sender signs. Rows from before migration 011 carry no
+// scheme and keep the gateway protocol; an unknown value is a configuration
+// fault (503 at ingest), never a fallback to a weaker check.
+export function sourceScheme(source: SourceConfig): SignatureScheme {
+  const scheme = source.signature_scheme ?? DEFAULT_SIGNATURE_SCHEME;
+  if (!isSignatureScheme(scheme)) throw new Error("Unknown signature scheme");
+  return scheme;
 }
 
 // Routes are operator-controlled, never taken from webhook payloads. This is
@@ -38,12 +50,21 @@ export function sourceSecret(source: SourceConfig): string {
   return secret;
 }
 
-export async function saveSource(name: string, destination: string, secretEnv: string) {
+export async function saveSource(
+  name: string, destination: string, secretEnv: string, scheme: string = DEFAULT_SIGNATURE_SCHEME
+) {
   if (!SOURCE_PATTERN.test(name)) throw new Error("Invalid source name");
-  const config = { name, destination_url: validateDestination(destination), secret_env: secretEnv, enabled: true };
+  if (!isSignatureScheme(scheme)) {
+    throw new Error(`Invalid signature scheme; expected one of: ${SIGNATURE_SCHEMES.join(", ")}`);
+  }
+  const config = {
+    name, destination_url: validateDestination(destination), secret_env: secretEnv, enabled: true,
+    signature_scheme: scheme,
+  };
   sourceSecret(config); // fail before registering an unusable route
+  // Needs migration 011 (4-argument upsert_webhook_source).
   const { error } = await getSupabase().rpc("upsert_webhook_source", {
-    p_name: name, p_destination_url: config.destination_url, p_secret_env: secretEnv,
+    p_name: name, p_destination_url: config.destination_url, p_secret_env: secretEnv, p_signature_scheme: scheme,
   });
   if (error) throw new Error("Failed to save source");
 }

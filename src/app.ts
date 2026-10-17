@@ -6,8 +6,9 @@ import { randomUUID } from "node:crypto";
 import { getSupabase } from "./supabase";
 import { dashboardRouter } from "./dashboard";
 import { hasValidSession } from "./auth";
-import { verifySignature, SIGNATURE_HEADER } from "./signature";
-import { getSource, sourceSecret, SOURCE_PATTERN, validateDestination } from "./sources";
+import { verifyIngest, AUTH_HEADERS } from "./adapters";
+import { getSource, sourceScheme, sourceSecret, SOURCE_PATTERN, validateDestination } from "./sources";
+import type { SignatureScheme } from "./adapters";
 import { asyncRoute } from "./asyncRoute";
 import { gatewayMetrics, hasMetricsBearer } from "./metrics";
 export { SOURCE_PATTERN } from "./sources";
@@ -85,7 +86,6 @@ app.get("/health", asyncRoute(async (_req, res) => {
 // Responds immediately — actual delivery is the Phase 3 worker's job.
 app.post("/webhooks/:source", asyncRoute(async (req, res) => {
   const source = req.params.source;
-  const idempotencyKey = req.header("Idempotency-Key") || null;
   const payload = req.body;
 
   if (!SOURCE_PATTERN.test(source)) {
@@ -106,21 +106,27 @@ app.post("/webhooks/:source", asyncRoute(async (req, res) => {
   // the environment variable name or secret to the caller.
   let signingSecret: string;
   let destinationUrl: string;
+  let scheme: SignatureScheme;
   try {
     signingSecret = sourceSecret(route);
     destinationUrl = validateDestination(route.destination_url);
+    scheme = sourceScheme(route);
   } catch {
     return res.status(503).json({ error: "Source unavailable" });
   }
-  const result = verifySignature({
-    secret: signingSecret, header: req.header(SIGNATURE_HEADER),
+  // Verified the way this source's provider signs (gateway, GitHub or Stripe).
+  // The adapter also says which value dedupes a redelivery for that provider.
+  const result = verifyIngest({
+    scheme, secret: signingSecret,
+    header: (name) => req.header(name),
     rawBody: (req as RawBodyRequest).rawBody ?? "",
-    idempotencyKey,
+    payload,
   });
   if (!result.ok) {
     console.warn(`[ingest] rejected ${source}: ${result.reason}`);
     return res.status(401).json({ error: "Invalid signature" });
   }
+  const idempotencyKey = result.idempotencyKey;
 
   if (!payload || typeof payload !== "object" || Array.isArray(payload) || Object.keys(payload).length === 0) {
     return res
@@ -139,7 +145,7 @@ app.post("/webhooks/:source", asyncRoute(async (req, res) => {
       idempotency_key: idempotencyKey,
       // Authentication material must not be retained in event history.
       headers: Object.fromEntries(Object.entries(req.headers).filter(([key]) =>
-        ![SIGNATURE_HEADER, "authorization", "cookie"].includes(key))),
+        !AUTH_HEADERS.includes(key))),
       payload,
       // Exact bytes received. The worker delivers these, so numbers beyond
       // 2^53 and the sender's formatting survive. Needs migrations/009.
