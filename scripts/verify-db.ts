@@ -21,9 +21,11 @@ type RpcOutcome = { error: RpcError | null };
 export interface Probe {
   rpc(fn: string, args?: Record<string, unknown>): Promise<RpcOutcome>;
   selectColumns(table: string, columns: string): Promise<RpcOutcome>;
+  // Names of every RPC the API exposes, or null when the listing is unavailable.
+  listRpcs(): Promise<Set<string> | null>;
 }
 
-export function probeFromClient(client: SupabaseClient): Probe {
+export function probeFromClient(client: SupabaseClient, url: string, key: string): Probe {
   return {
     rpc: async (fn, args) => {
       const { error } = await client.rpc(fn, args);
@@ -32,6 +34,23 @@ export function probeFromClient(client: SupabaseClient): Probe {
     selectColumns: async (table, columns) => {
       const { error } = await client.from(table).select(columns).limit(1);
       return { error };
+    },
+    // PostgREST's OpenAPI root lists every exposed function as a /rpc/<name>
+    // path. Definitive, and it runs nothing.
+    listRpcs: async () => {
+      try {
+        const res = await fetch(`${url.replace(/\/$/, "")}/rest/v1/`, {
+          headers: { apikey: key, Authorization: `Bearer ${key}`, Accept: "application/openapi+json" },
+        });
+        if (!res.ok) return null;
+        const doc = (await res.json()) as { paths?: Record<string, unknown> };
+        const names = Object.keys(doc.paths ?? {})
+          .filter((p) => p.startsWith("/rpc/"))
+          .map((p) => p.slice("/rpc/".length));
+        return new Set(names);
+      } catch {
+        return null;
+      }
     },
   };
 }
@@ -77,7 +96,16 @@ export async function checkDatabase(service: Probe, anon: Probe | null): Promise
       : { name: `service_role: ${fn}`, status: "ok", detail: "callable" });
   }
 
+  // Mutating RPCs are never called. The API's own function listing is the
+  // source of truth; the bogus-argument probe is only a fallback.
+  const listed = await service.listRpcs();
   for (const fn of WRITE_RPCS) {
+    if (listed) {
+      results.push(listed.has(fn)
+        ? { name: `service_role: ${fn}`, status: "ok", detail: "present (listed by the API, not executed)" }
+        : { name: `service_role: ${fn}`, status: "fail", detail: "missing: not in the API's function listing" });
+      continue;
+    }
     const { error } = await service.rpc(fn, { p_verify_db_probe: true });
     const exists = fnExistsByHint(fn, error);
     results.push(exists
@@ -147,8 +175,8 @@ async function main(): Promise<void> {
     return;
   }
   const opts = { auth: { persistSession: false, autoRefreshToken: false } };
-  const service = probeFromClient(createClient(url, serviceKey, opts));
-  const anon = anonKey ? probeFromClient(createClient(url, anonKey, opts)) : null;
+  const service = probeFromClient(createClient(url, serviceKey, opts), url, serviceKey);
+  const anon = anonKey ? probeFromClient(createClient(url, anonKey, opts), url, anonKey) : null;
 
   const results = await checkDatabase(service, anon);
   for (const line of formatResults(results)) console.log(line);

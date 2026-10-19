@@ -10,8 +10,10 @@ function fakeProbe(opts: {
   present: Set<string>;
   columns?: Record<string, string[]>;
   denyAll?: boolean;
+  noListing?: boolean;
 }): Probe {
   return {
+    listRpcs: async () => (opts.noListing ? null : new Set(opts.present)),
     rpc: async (fn, args) => {
       if (opts.denyAll) return { error: { code: "42501", message: "permission denied for function " + fn } as Err };
       if (!opts.present.has(fn)) {
@@ -58,8 +60,16 @@ describe("verify-db", () => {
     const anon = fakeProbe({ present: ALL_FNS, columns: ALL_COLUMNS, denyAll: true });
     const results = await checkDatabase(service, anon);
     expect(results.filter((r) => r.status !== "ok")).toEqual([]);
-    expect(results.some((r) => r.name === "service_role: claim_pending_webhook_events")).toBe(true);
+    expect(results.find((r) => r.name === "service_role: claim_pending_webhook_events")?.detail).toMatch(/listed by the API/);
     expect(results.some((r) => r.name.startsWith("anon denied: table dashboard_sessions"))).toBe(true);
+  });
+
+  it("falls back to the bogus-argument probe when the API listing is unavailable", async () => {
+    const present = new Set(ALL_FNS);
+    present.delete("replay_webhook_event");
+    const results = await checkDatabase(fakeProbe({ present, columns: ALL_COLUMNS, noListing: true }), null);
+    expect(results.find((r) => r.name === "service_role: replay_webhook_event")?.status).toBe("fail");
+    expect(results.find((r) => r.name === "service_role: claim_pending_webhook_events")?.detail).toMatch(/bogus argument/);
   });
 
   it("reports a missing 009 RPC and column without touching data", async () => {
