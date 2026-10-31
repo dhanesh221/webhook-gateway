@@ -87,7 +87,14 @@ const defaultDeliver: DeliverFn = async (url, payload, rawBody, headers) => {
 
 export type BatchOutcome = {
   id: string;
-  outcome: "delivered" | "retry" | "dead_lettered" | "skipped" | "released" | "rate_limited";
+  outcome:
+    | "delivered" | "retry" | "dead_lettered" | "skipped" | "released" | "rate_limited"
+    // The *_unrecorded forms mean the delivery decision really happened (HTTP
+    // success, a breaker skip, a scheduled retry) but the database write that
+    // records it failed, so the row stays in_progress and stale-claim recovery
+    // will return it to pending — for delivered_unrecorded that means the
+    // destination will see the event a second time.
+    | "delivered_unrecorded" | "retry_unrecorded" | "dead_letter_unrecorded" | "skip_unrecorded";
   attempt: number;
 };
 
@@ -265,9 +272,6 @@ async function processRow(
       const { error: markError } = await supabase.rpc("mark_webhook_event_delivered", {
         p_id: row.id,
       });
-      if (markError) {
-        console.error(`[worker] event ${row.id}: failed to mark delivered (${markError.message})`);
-      }
       const { error: successError } = await supabase.rpc("record_delivery_success", {
         p_destination_url: row.destination_url,
       });
@@ -276,8 +280,19 @@ async function processRow(
           `[worker] failed to record delivery success for ${row.destination_url}: ${successError.message}`
         );
       }
-      console.log(`[worker] event ${row.id} attempt ${attemptNumber}: delivered`);
-      results.push({ id: row.id, outcome: "delivered", attempt: attemptNumber });
+      if (markError) {
+        // The destination accepted the event but the database never heard about
+        // it: the row stays in_progress and stale-claim recovery will return it
+        // to pending, so the destination will see this event again. Say so, and
+        // do not report "delivered".
+        console.error(
+          `[worker] event ${row.id}: delivered over HTTP but the database mark failed (${markError.message}); stale-claim recovery will re-deliver this event`
+        );
+        results.push({ id: row.id, outcome: "delivered_unrecorded", attempt: attemptNumber });
+      } else {
+        console.log(`[worker] event ${row.id} attempt ${attemptNumber}: delivered`);
+        results.push({ id: row.id, outcome: "delivered", attempt: attemptNumber });
+      }
     } else {
       if (result.status !== undefined) {
         console.log(
@@ -310,7 +325,12 @@ async function skipUntil(
     p_next_attempt_at: until,
   });
   if (error) {
-    console.error(`[worker] event ${row.id}: failed to mark skipped (${error.message})`);
+    // The skip was never recorded: the row stays in_progress, so stale-claim
+    // recovery — not `until` — decides when it is attempted next.
+    console.error(
+      `[worker] event ${row.id}: failed to mark skipped (${error.message}); stale-claim recovery will return it to pending`
+    );
+    return { id: row.id, outcome: "skip_unrecorded", attempt: row.attempts };
   }
   console.log(`[worker] ${reason} for ${row.destination_url}, skipping event ${row.id} until ${until}`);
   return { id: row.id, outcome: "skipped", attempt: row.attempts };
@@ -417,12 +437,23 @@ async function retryOrDeadLetter(
     p_max_attempts: MAX_ATTEMPTS,
   });
 
+  const outcome = attemptNumber >= MAX_ATTEMPTS ? "dead_lettered" : "retry";
+
   if (error) {
-    console.error(`[worker] event ${row.id}: failed to mark retry (${error.message})`);
+    // Nothing was recorded: the row stays in_progress and stale-claim recovery
+    // will return it to pending, retrying without the backoff this write was
+    // meant to schedule.
+    console.error(
+      `[worker] event ${row.id}: failed to record the ${outcome === "retry" ? "retry" : "dead-letter"} (${error.message}); stale-claim recovery will return it to pending`
+    );
+    return {
+      id: row.id,
+      outcome: outcome === "retry" ? "retry_unrecorded" : "dead_letter_unrecorded",
+      attempt: attemptNumber,
+    };
   }
 
-  const outcome = attemptNumber >= MAX_ATTEMPTS ? "dead_lettered" : "retry";
-  if (!error) metrics.increment(outcome === "retry" ? "retried" : "dead_lettered", row.source, row.destination_url);
+  metrics.increment(outcome === "retry" ? "retried" : "dead_lettered", row.source, row.destination_url);
   console.log(
     outcome === "dead_lettered"
       ? `[worker] event ${row.id} attempt ${attemptNumber}: exceeded ${MAX_ATTEMPTS} attempts, dead-lettered`
