@@ -1,4 +1,4 @@
-// Phase 5 dashboard API. Mounted at /api by src/app.ts.
+// Dashboard API. Mounted at /api by src/app.ts.
 //
 // Database RPCs are restricted to the server-only service role by Phase A.
 import express from "express";
@@ -147,7 +147,7 @@ dashboardRouter.post("/events/:id/replay", asyncRoute(async (req, res) => {
   const id = req.params.id;
 
   // replay_webhook_event returns { data: null, error: null } whether it replayed
-  // a row or matched nothing (confirmed empirically in Phase 4). So, exactly as
+  // a row or matched nothing (confirmed empirically against the live RPC). So, exactly as
   // the DLQ CLI does, check that the event really is dead-lettered first —
   // otherwise every replay would report success, including replays of ids that
   // don't exist or are still pending.
