@@ -2,7 +2,7 @@
 
 An HTTP webhook ingest, delivery, and replay gateway. It stores accepted events in Supabase/Postgres, delivers them to registered source destinations, retries failures with jittered backoff, holds exhausted events in a dead-letter queue, and provides a dashboard for inspection and replay.
 
-Status: Phase 7, production-polish work. Phase 6 (CLI + development tunnel) is complete. This is a single-operator gateway, not a multi-tenant service or a claim of production readiness.
+Status: Phase 7, production-polish work. Migrations 008-013 are applied to the live Supabase project and `npm run verify:db` passes against it (36 ok, 0 failed, anon key locked out of every table and RPC). Deployment and source-secret setup are still pending. This is a single-operator gateway, not a multi-tenant service or a claim of production readiness.
 
 ## Delivery contract
 
@@ -208,7 +208,7 @@ cd deploy && docker compose up -d --build
 - `deploy/docker-compose.yml` + `deploy/Caddyfile`: Caddy obtains and renews a Let's Encrypt certificate for `GATEWAY_DOMAIN`, adds HSTS and `nosniff`, caps request bodies at 2 MB, health-checks the gateway on `/health`, and is the only published port. The gateway runs with `NODE_ENV=production`, `PORT=3000`, `TRUST_PROXY=1` (Caddy is the one trusted hop, so `req.ip` is the real client), and `stop_grace_period: 30s` so in-flight deliveries finish on SIGTERM.
 - `NODE_ENV=production` also makes `start` refuse to open a development tunnel, marks cookies `Secure`, and rejects loopback HTTP destinations.
 
-Secrets: the service-role key, source secrets, `ADMIN_PASSWORD_HASH`, `SESSION_SECRET` and `METRICS_TOKEN` live only in the environment of the gateway process (here, `deploy/.env` on the host). They are never written to `public/`, never logged (ingest logs the rejection reason, not the header; the worker logs event ids, not payloads), and never returned in HTTP responses. Point the gateway at a Supabase project that holds nothing else, because the service-role key bypasses RLS on everything in that project.
+Secrets: the service-role key, source secrets, `ADMIN_PASSWORD_HASH`, `SESSION_SECRET` and `WG_METRICS_TOKEN` live only in the environment of the gateway process (here, `deploy/.env` on the host). They are never written to `public/`, never logged (ingest logs the rejection reason, not the header; the worker logs event ids, not payloads), and never returned in HTTP responses. Point the gateway at a Supabase project that holds nothing else, because the service-role key bypasses RLS on everything in that project.
 
 Any other host works the same way: build the image, provide the environment, put an HTTPS proxy in front that forwards `X-Forwarded-For`, set `TRUST_PROXY` to match the number of trusted hops (or the proxy's CIDR), and probe `/health`. For several gateway instances, read the note under "Remaining work".
 
@@ -265,7 +265,7 @@ Refill uses a monotonic clock. Open circuit breakers defer without spending toke
 
 ## Remaining work before a public service
 
-- Confirm the reconstructed `migrations/000_base_schema.sql` against the live project: run `migrations/inspect_live_schema.sql`, diff the function bodies, correct 000 where they differ, then run `npm run verify:db` to check RPC presence and that anon is locked out.
+- Confirm the reconstructed `migrations/000_base_schema.sql` against the live project: run `migrations/inspect_live_schema.sql`, diff the function bodies, and correct 000 where they differ. (`npm run verify:db` already passes against the live project, 36 ok / 0 failed, including the anon lockout checks; only the 000 diff is still open.)
 - Polls within one worker do not overlap, and open-breaker probes are leased across workers (010), so multiple worker processes can run; claims use the database's row locking.
 - Add a distinct outbound secret per destination and destination controls appropriate for any multi-tenant use. The Docker image and Caddy stack under `deploy/` give one HTTPS instance; multi-instance deployments need a shared rate limiter at the proxy (ingest and login limits are in-process) and per-process metrics scraping.
 - Service-role access has broad privileges; keep the gateway in its own Supabase project so that key reaches nothing else.
@@ -279,7 +279,7 @@ Refill uses a monotonic clock. Open circuit breakers defer without spending toke
 4. DLQ + circuit breaker
 5. Dashboard
 6. CLI + development tunnel (complete)
-7. Production polish (Phase A in this branch; live migration/deployment pending)
+7. Production polish (live migration applied and verified; deployment pending)
 
 ### Dependency audit
 

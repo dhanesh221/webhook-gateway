@@ -108,7 +108,7 @@ app.get("/health", asyncRoute(async (_req, res) => {
 }));
 
 // Receives a webhook from an external provider and stores it for later delivery.
-// Responds immediately — actual delivery is the Phase 3 worker's job.
+// Responds immediately — actual delivery is the delivery worker's job.
 app.post("/webhooks/:source", asyncRoute(async (req, res) => {
   const source = req.params.source;
   const payload = req.body;
@@ -215,7 +215,7 @@ app.post("/webhooks/:source", asyncRoute(async (req, res) => {
   return res.status(202).json({ id, status: "pending" });
 }));
 
-// Phase 5 dashboard. Mounted after the ingest routes so nothing here can shadow
+// Dashboard API. Mounted after the ingest routes so nothing here can shadow
 // them, and before express.static so that a stray public/api/... file could
 // never shadow the API. See Concepts/Express routing order.
 app.use("/api", dashboardRouter);

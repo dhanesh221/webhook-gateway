@@ -1,10 +1,10 @@
 // Public tunnel to the local ingest server.
 //
 // Tool: localtunnel. Cloudflare quick tunnels would have been the better choice
-// (no interstitial, more reliable), but `cloudflared` is not installed on this
-// machine and installing it needs a system package manager and sudo, which is
-// out of scope here. localtunnel is a plain npm dependency with a programmatic
-// Node API and no signup, so it works with what's actually available.
+// (no interstitial, more reliable), but `cloudflared` installs through a system
+// package manager and needs sudo, which is out of scope for a development
+// convenience. localtunnel is a plain npm dependency with a programmatic Node
+// API and no signup, so it works anywhere `npm install` does.
 //
 // The caveat that comes with that choice: loca.lt shows a one-time "click to
 // continue" interstitial page to a visitor's IP the first time it sees it. A
